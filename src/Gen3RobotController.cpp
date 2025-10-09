@@ -349,7 +349,7 @@ void Gen3RobotController::setGripperPosition(float position, float speed_ratio) 
     
     // Calculate position error
     float position_error = target_pct - current_pct;
-    float tolerance = 1.5f;  // 1.5% tolerance
+    float tolerance = 0.1f;  // 1.5% tolerance
     
     // Calculate desired velocity with P control
     float kp = 2.0f;  // Proportional gain
