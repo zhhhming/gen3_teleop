@@ -82,7 +82,8 @@ public:
           filter_initialized_(false),
           filter_alpha_(0.01f),
           gripper_control_mode_(0),  // 0: trigger mode, 1: button mode
-          gripper_step_value_(0.1f)
+          gripper_step_value_(0.1f),
+          gripper_button_repeat_interval_(0.2)  // 0.2秒重复间隔
     {
         // 初始化状态向量
         target_joints_.resize(num_joints_, 0.0f);
@@ -107,6 +108,10 @@ public:
         button_b_prev_ = false;
         button_x_prev_ = false;
         button_y_prev_ = false;
+        
+        // 初始化按钮计时器（用于重复触发）
+        button_x_last_trigger_time_ = std::chrono::steady_clock::now();
+        button_y_last_trigger_time_ = std::chrono::steady_clock::now();
         
         // 创建订阅器
         grip_sub_ = this->create_subscription<std_msgs::msg::Float32>(
@@ -146,6 +151,7 @@ public:
         RCLCPP_INFO(this->get_logger(), "  - Button B: Cycle step value (0.1/0.01/0.001/0.0001)");
         RCLCPP_INFO(this->get_logger(), "  - Button X: Increase gripper (in button mode)");
         RCLCPP_INFO(this->get_logger(), "  - Button Y: Decrease gripper (in button mode)");
+        RCLCPP_INFO(this->get_logger(), "  - Hold button: Repeat every 0.2s");
     }
     
     ~Gen3XRTeleopNode() {
@@ -542,20 +548,60 @@ private:
                     // Trigger 模式：直接使用 trigger 值
                     new_gripper_target = std::max(0.0f, std::min(1.0f, trigger_value));
                 } else {
-                    // Button 模式：使用 X/Y 按钮增减
+                    // Button 模式：使用 X/Y 按钮增减（带重复间隔）
+                    auto current_time = std::chrono::steady_clock::now();
+                    
                     // 处理按钮 X：增加
-                    if (button_x && !button_x_prev_) {
-                        new_gripper_target += gripper_step_value_;
-                        new_gripper_target = std::max(0.0f, std::min(1.0f, new_gripper_target));
-                        RCLCPP_INFO(this->get_logger(), "Gripper target: %.4f (increased)", new_gripper_target);
+                    if (button_x) {
+                        bool should_trigger = false;
+                        
+                        if (!button_x_prev_) {
+                            // 首次按下，立即触发
+                            should_trigger = true;
+                            button_x_last_trigger_time_ = current_time;
+                        } else {
+                            // 持续按住，检查是否超过重复间隔
+                            auto elapsed = std::chrono::duration<double>(
+                                current_time - button_x_last_trigger_time_).count();
+                            if (elapsed >= gripper_button_repeat_interval_) {
+                                should_trigger = true;
+                                button_x_last_trigger_time_ = current_time;
+                            }
+                        }
+                        
+                        if (should_trigger) {
+                            new_gripper_target += gripper_step_value_;
+                            new_gripper_target = std::max(0.0f, std::min(1.0f, new_gripper_target));
+                            RCLCPP_INFO(this->get_logger(), "Gripper target: %.4f (increased)", 
+                                       new_gripper_target);
+                        }
                     }
                     button_x_prev_ = button_x;
                     
                     // 处理按钮 Y：减少
-                    if (button_y && !button_y_prev_) {
-                        new_gripper_target -= gripper_step_value_;
-                        new_gripper_target = std::max(0.0f, std::min(1.0f, new_gripper_target));
-                        RCLCPP_INFO(this->get_logger(), "Gripper target: %.4f (decreased)", new_gripper_target);
+                    if (button_y) {
+                        bool should_trigger = false;
+                        
+                        if (!button_y_prev_) {
+                            // 首次按下，立即触发
+                            should_trigger = true;
+                            button_y_last_trigger_time_ = current_time;
+                        } else {
+                            // 持续按住，检查是否超过重复间隔
+                            auto elapsed = std::chrono::duration<double>(
+                                current_time - button_y_last_trigger_time_).count();
+                            if (elapsed >= gripper_button_repeat_interval_) {
+                                should_trigger = true;
+                                button_y_last_trigger_time_ = current_time;
+                            }
+                        }
+                        
+                        if (should_trigger) {
+                            new_gripper_target -= gripper_step_value_;
+                            new_gripper_target = std::max(0.0f, std::min(1.0f, new_gripper_target));
+                            RCLCPP_INFO(this->get_logger(), "Gripper target: %.4f (decreased)", 
+                                       new_gripper_target);
+                        }
                     }
                     button_y_prev_ = button_y;
                 }
@@ -564,6 +610,25 @@ private:
                 {
                     std::lock_guard<std::mutex> lock(state_mutex_);
                     target_gripper_ = new_gripper_target;
+                }
+                
+                // 获取当前关节位置用于 FK
+                KDL::JntArray current_joints_kdl(num_joints_);
+                {
+                    std::lock_guard<std::mutex> lock(state_mutex_);
+                    for (int i = 0; i < num_joints_; ++i) {
+                        current_joints_kdl(i) = current_joints_[i] * M_PI / 180.0;
+                    }
+                }
+                
+                // 计算当前 end effector frame（每次循环都更新）
+                KDL::Frame current_ee_frame;
+                fk_solver_->JntToCart(current_joints_kdl, current_ee_frame);
+                
+                // 存储 current frame
+                {
+                    std::lock_guard<std::mutex> lock(frame_mutex_);
+                    current_ee_frame_ = current_ee_frame;
                 }
                 
                 // 检查激活状态
@@ -581,19 +646,6 @@ private:
                 }
                 
                 if (is_active_) {
-                    // 获取当前关节位置用于 FK
-                    KDL::JntArray current_joints_kdl(num_joints_);
-                    {
-                        std::lock_guard<std::mutex> lock(state_mutex_);
-                        for (int i = 0; i < num_joints_; ++i) {
-                            current_joints_kdl(i) = current_joints_[i] * M_PI / 180.0;
-                        }
-                    }
-                    
-                    // 计算当前 end effector frame
-                    KDL::Frame current_ee_frame;
-                    fk_solver_->JntToCart(current_joints_kdl, current_ee_frame);
-                    
                     // 初始化参考坐标系
                     if (!ref_ee_valid_) {
                         ref_ee_frame_ = current_ee_frame;
@@ -627,9 +679,18 @@ private:
                     int ret = tracik_solver_->CartToJnt(current_joints_kdl, target_frame, ik_solution);
                     
                     if (ret >= 0) {
-                        std::lock_guard<std::mutex> lock(state_mutex_);
-                        for (int i = 0; i < num_joints_; ++i) {
-                            target_joints_[i] = normalizeAngle(ik_solution(i) * 180.0 / M_PI);
+                        // IK 成功，更新 target joints 和 target frame
+                        {
+                            std::lock_guard<std::mutex> lock(state_mutex_);
+                            for (int i = 0; i < num_joints_; ++i) {
+                                target_joints_[i] = normalizeAngle(ik_solution(i) * 180.0 / M_PI);
+                            }
+                        }
+                        
+                        // 更新 target frame（只在IK成功时更新）
+                        {
+                            std::lock_guard<std::mutex> lock(frame_mutex_);
+                            target_ee_frame_ = target_frame;
                         }
                     } else {
                         static int fail_count = 0;
@@ -637,9 +698,12 @@ private:
                             RCLCPP_WARN(this->get_logger(), "IK solution not found");
                         }
                     }
-                    
-                    // 发布 TF
-                    publishTF(current_ee_frame, target_frame);
+                }
+                
+                // 发布 TF（不管是否 active 都发布）
+                {
+                    std::lock_guard<std::mutex> lock(frame_mutex_);
+                    publishTF(current_ee_frame_, target_ee_frame_);
                 }
                 
             } catch (const std::exception& e) {
@@ -789,6 +853,11 @@ private:
     bool button_x_prev_;
     bool button_y_prev_;
     
+    // 按钮重复触发控制
+    std::chrono::steady_clock::time_point button_x_last_trigger_time_;
+    std::chrono::steady_clock::time_point button_y_last_trigger_time_;
+    double gripper_button_repeat_interval_;  // 重复间隔（秒）
+    
     // 线程控制
     std::atomic<bool> shutdown_requested_;
     
@@ -797,6 +866,11 @@ private:
     std::vector<float> target_joints_;
     std::vector<float> current_joints_;
     float target_gripper_;
+    
+    // Frame 状态（受 frame_mutex_ 保护）
+    std::mutex frame_mutex_;
+    KDL::Frame current_ee_frame_;
+    KDL::Frame target_ee_frame_;
     
     // 控制状态
     std::atomic<bool> is_active_;
