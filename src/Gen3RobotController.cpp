@@ -176,16 +176,38 @@ bool Gen3RobotController::clearFaults() {
     return false;
 }
 
+k_api::Base::ServoingMode currentServoingMode(k_api::Base::BaseClient* base)
+{
+    auto m = base->GetServoingMode();
+    return m.servoing_mode();
+}
+
 // Enter low-level control mode
 bool Gen3RobotController::enterLowLevelMode() {
-    if (in_low_level_mode_) {
-        std::cout << "Already in low-level mode" << std::endl;
-        return true;
-    }
+
 
     if (!base_client_) {
         std::cerr << "Gen3RobotController: base client not available, cannot enter low level mode." << std::endl;
         return false;
+    }
+        // 与真实状态同步
+    auto cur_mode = currentServoingMode(base_client_);
+    if (cur_mode == k_api::Base::LOW_LEVEL_SERVOING) {
+        // 已经在低级模式：保证标志同步并返回 true（幂等）
+        if (!in_low_level_mode_) {
+            std::cout << "Already in low-level mode (syncing internal flag)." << std::endl;
+            in_low_level_mode_ = true;
+        } else {
+            std::cout << "Already in low-level mode." << std::endl;
+        }
+        return true;
+    }
+    previous_servoing_mode_ = base_client_->GetServoingMode();
+
+    // 若内部标志与真实状态不一致，纠正一下
+    if (in_low_level_mode_) {
+        std::cout << "Internal flag says low-level, but controller is not. Fixing flag." << std::endl;
+        in_low_level_mode_ = false;
     }
 
     // Clear any existing faults before entering low-level mode
@@ -198,8 +220,12 @@ bool Gen3RobotController::enterLowLevelMode() {
 
     try {
         // Stop any ongoing motion
-        base_client_->Stop();
-        std::this_thread::sleep_for(std::chrono::milliseconds(50));
+        try {
+            base_client_->Stop();
+            std::this_thread::sleep_for(std::chrono::milliseconds(50));
+        } catch (const k_api::KDetailedException& ex) {
+            std::cerr << "Warning: Stop before switching to low-level failed: " << ex.what() << std::endl;
+        }
 
         // Set to low-level servoing mode
         k_api::Base::ServoingModeInformation servoing_mode;
@@ -291,6 +317,8 @@ bool Gen3RobotController::initializeBaseCommand() {
     }
 }
 
+
+
 // Exit low-level control mode
 bool Gen3RobotController::exitLowLevelMode() {
     if (!in_low_level_mode_) {
@@ -300,13 +328,27 @@ bool Gen3RobotController::exitLowLevelMode() {
     std::cout << "Exiting low-level servoing mode..." << std::endl;
 
     try {
-        // Stop robot motion first
-        base_client_->Stop();
-        std::this_thread::sleep_for(std::chrono::milliseconds(100));
 
         // Restore previous servoing mode
         base_client_->SetServoingMode(previous_servoing_mode_);
-
+        bool mode_changed = false;
+        for (int i = 0; i < 300; ++i) {
+            if (currentServoingMode(base_client_) == previous_servoing_mode_.servoing_mode()) {
+                mode_changed = true;
+                break;
+            }
+            std::this_thread::sleep_for(std::chrono::milliseconds(10));
+        }
+        if (!mode_changed) {
+            std::cerr << "Failed to leave LOW_LEVEL_SERVOING (timeout switching mode)" << std::endl;
+            return false;
+        }
+        try {
+            base_client_->Stop();
+        } catch (const k_api::KDetailedException& ex) {
+            // 某些固件不要求此步，失败也不致命，记录一下
+            std::cerr << "Warning: Stop after mode switch failed: " << ex.what() << std::endl;
+        }
         in_low_level_mode_ = false;
         std::cout << "Low-level servoing mode deactivated" << std::endl;
         return true;
@@ -489,13 +531,20 @@ void Gen3RobotController::updateStateFromFeedback() {
 // Stop robot motion
 void Gen3RobotController::stopRobot() {
     try {
-        if (base_client_) {
-            base_client_->Stop();
-            std::cout << "Robot stopped" << std::endl;
+        if (!base_client_) return;
+
+        auto mode = currentServoingMode(base_client_);
+        if (mode == k_api::Base::LOW_LEVEL_SERVOING) {
+            std::cout << "Skip Stop(): robot is in LOW_LEVEL_SERVOING, call exitLowLevelMode() first." << std::endl;
+            return;
         }
-    } catch (k_api::KDetailedException& ex) {
+
+        base_client_->Stop();
+        std::cout << "Robot stopped" << std::endl;
+
+    } catch (const k_api::KDetailedException& ex) {
         std::cerr << "Failed to stop robot: " << ex.what() << std::endl;
-    } catch (std::exception& ex) {
+    } catch (const std::exception& ex) {
         std::cerr << "Failed to stop robot: " << ex.what() << std::endl;
     } catch (...) {
         std::cerr << "Failed to stop robot due to unknown error" << std::endl;

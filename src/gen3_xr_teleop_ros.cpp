@@ -86,7 +86,7 @@ public:
           log_file_path_(log_file),
           shutdown_requested_(false),
           num_joints_(7),
-          scale_factor_(1.1f),
+          scale_factor_(1.0f),
           ik_rate_hz_(50),
           control_rate_hz_(1000),
           is_active_(false),
@@ -97,7 +97,7 @@ public:
           gripper_control_mode_(0),  // 0: trigger mode, 1: button mode
           gripper_step_value_(0.1f),
           gripper_button_repeat_interval_(0.1),
-          data_logging_enabled_(true)  // 默认开启数据记录
+          data_logging_enabled_(false)  // 默认关闭数据记录
     {
         // 初始化状态向量
         target_joints_.resize(num_joints_, 0.0f);
