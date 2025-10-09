@@ -1,11 +1,6 @@
 /**
- * Gen3 XR Teleoperation ROS2 Node
- * 订阅 XR 数据话题，实时控制 Kinova Gen3 机械臂
- * 
- * 架构：
- * - ROS2 回调：接收 XR 数据并更新共享状态
- * - IK 线程：计算逆运动学，生成目标关节角度
- * - Control 线程：1kHz 控制循环，发送命令到机械臂
+ * Gen3 XR Teleoperation ROS2 Node with Data Logging
+ * 订阅 XR 数据话题，实时控制 Kinova Gen3 机械臂，并记录位置数据
  */
 
 #include <rclcpp/rclcpp.hpp>
@@ -27,6 +22,7 @@
 #include <fstream>
 #include <algorithm>
 #include <cmath>
+#include <iomanip>
 
 #ifdef __linux__
 #include <pthread.h>
@@ -57,33 +53,44 @@ void signal_handler(int sig) {
     g_shutdown_requested = true;
 }
 
+// 数据记录结构
+struct JointDataPoint {
+    double timestamp;  // 相对于开始时间的秒数
+    std::vector<float> current_positions;  // 当前位置
+    std::vector<float> target_positions;   // 目标位置
+    std::vector<float> differences;        // 差值（处理后的）
+};
+
 /**
- * ROS2 节点：Gen3 XR 遥操作控制器
+ * ROS2 节点：Gen3 XR 遥操作控制器（带数据记录）
  */
 class Gen3XRTeleopNode : public rclcpp::Node {
 public:
     Gen3XRTeleopNode(const std::string& robot_urdf_path,
                      const std::string& robot_ip = "192.168.1.10",
                      int tcp_port = 10000,
-                     int udp_port = 10001)
+                     int udp_port = 10001,
+                     const std::string& log_file = "joint_tracking_data.csv")
         : Node("gen3_xr_teleop_node"),
           robot_urdf_path_(robot_urdf_path),
           robot_ip_(robot_ip),
           tcp_port_(tcp_port),
           udp_port_(udp_port),
+          log_file_path_(log_file),
           shutdown_requested_(false),
           num_joints_(7),
-          scale_factor_(0.7f),
+          scale_factor_(0.8f),
           ik_rate_hz_(50),
           control_rate_hz_(1000),
           is_active_(false),
           ref_ee_valid_(false),
           ref_controller_valid_(false),
           filter_initialized_(false),
-          filter_alpha_(0.01f),
+          filter_alpha_(0.009f),
           gripper_control_mode_(0),  // 0: trigger mode, 1: button mode
           gripper_step_value_(0.1f),
-          gripper_button_repeat_interval_(0.2)  // 0.2秒重复间隔
+          gripper_button_repeat_interval_(0.2),
+          data_logging_enabled_(true)  // 默认开启数据记录
     {
         // 初始化状态向量
         target_joints_.resize(num_joints_, 0.0f);
@@ -109,9 +116,12 @@ public:
         button_x_prev_ = false;
         button_y_prev_ = false;
         
-        // 初始化按钮计时器（用于重复触发）
+        // 初始化按钮计时器
         button_x_last_trigger_time_ = std::chrono::steady_clock::now();
         button_y_last_trigger_time_ = std::chrono::steady_clock::now();
+        
+        // 初始化数据记录
+        start_time_ = std::chrono::steady_clock::now();
         
         // 创建订阅器
         grip_sub_ = this->create_subscription<std_msgs::msg::Float32>(
@@ -146,6 +156,9 @@ public:
         tf_broadcaster_ = std::make_shared<tf2_ros::TransformBroadcaster>(this);
         
         RCLCPP_INFO(this->get_logger(), "Gen3 XR Teleop Node created");
+        RCLCPP_INFO(this->get_logger(), "Data logging: %s", 
+                   data_logging_enabled_ ? "ENABLED" : "DISABLED");
+        RCLCPP_INFO(this->get_logger(), "Log file: %s", log_file_path_.c_str());
         RCLCPP_INFO(this->get_logger(), "Gripper control:");
         RCLCPP_INFO(this->get_logger(), "  - Button A: Toggle control mode (Trigger/Button)");
         RCLCPP_INFO(this->get_logger(), "  - Button B: Cycle step value (0.1/0.01/0.001/0.0001)");
@@ -209,6 +222,11 @@ public:
         }
         if (control_thread.joinable()) {
             control_thread.join();
+        }
+        
+        // 保存数据
+        if (data_logging_enabled_) {
+            saveLoggedData();
         }
         
         RCLCPP_INFO(this->get_logger(), "Teleoperation stopped");
@@ -386,6 +404,14 @@ private:
         return static_cast<float>(unwrapped);
     }
     
+    // 将target移到距离current最近的等效位置（考虑360度环绕）
+
+    float moveToNearestEquivalent(float target, float current) const {
+        // remainder(x, 360) ∈ (-180, 180]
+        const float delta = std::remainder(target - current, 360.0f);
+        return current + delta;
+    }
+    
     std::vector<float> filterJointPositions(const std::vector<float>& target_positions) {
         if (!filter_initialized_) {
             initializeFilterState(target_positions);
@@ -489,6 +515,74 @@ private:
         tf_broadcaster_->sendTransform(target_tf);
     }
     
+    // ========== 数据记录函数 ==========
+    
+    void logJointData(const std::vector<float>& current, const std::vector<float>& target) {
+        if (!data_logging_enabled_) return;
+        
+        auto now = std::chrono::steady_clock::now();
+        double elapsed = std::chrono::duration<double>(now - start_time_).count();
+        
+        JointDataPoint data_point;
+        data_point.timestamp = elapsed;
+        data_point.current_positions = current;
+        
+        // 处理target positions：移到距离current最近的等效位置
+        data_point.target_positions.resize(num_joints_);
+        data_point.differences.resize(num_joints_);
+        
+        for (int i = 0; i < num_joints_; ++i) {
+            float adjusted_target = moveToNearestEquivalent(target[i], current[i]);
+            data_point.target_positions[i] = adjusted_target;
+            data_point.differences[i] = adjusted_target - current[i];
+        }
+        
+        std::lock_guard<std::mutex> lock(log_data_mutex_);
+        logged_data_.push_back(data_point);
+    }
+    
+    void saveLoggedData() {
+        std::lock_guard<std::mutex> lock(log_data_mutex_);
+        
+        if (logged_data_.empty()) {
+            RCLCPP_WARN(this->get_logger(), "No data to save");
+            return;
+        }
+        
+        std::ofstream file(log_file_path_);
+        if (!file.is_open()) {
+            RCLCPP_ERROR(this->get_logger(), "Failed to open log file: %s", 
+                        log_file_path_.c_str());
+            return;
+        }
+        
+        // 写入表头
+        file << "timestamp";
+        for (int i = 0; i < num_joints_; ++i) {
+            file << ",current_j" << i 
+                 << ",target_j" << i 
+                 << ",diff_j" << i;
+        }
+        file << "\n";
+        
+        // 写入数据
+        file << std::fixed << std::setprecision(6);
+        for (const auto& data : logged_data_) {
+            file << data.timestamp;
+            for (int i = 0; i < num_joints_; ++i) {
+                file << "," << data.current_positions[i]
+                     << "," << data.target_positions[i]
+                     << "," << data.differences[i];
+            }
+            file << "\n";
+        }
+        
+        file.close();
+        
+        RCLCPP_INFO(this->get_logger(), "Saved %zu data points to %s", 
+                   logged_data_.size(), log_file_path_.c_str());
+    }
+    
     // ========== 线程函数 ==========
     
     void ikThread() {
@@ -554,7 +648,6 @@ private:
                     // 处理按钮 X：增加
                     if (button_x) {
                         bool should_trigger = false;
-                        
                         if (!button_x_prev_) {
                             // 首次按下，立即触发
                             should_trigger = true;
@@ -581,7 +674,6 @@ private:
                     // 处理按钮 Y：减少
                     if (button_y) {
                         bool should_trigger = false;
-                        
                         if (!button_y_prev_) {
                             // 首次按下，立即触发
                             should_trigger = true;
@@ -683,7 +775,7 @@ private:
                         {
                             std::lock_guard<std::mutex> lock(state_mutex_);
                             for (int i = 0; i < num_joints_; ++i) {
-                                target_joints_[i] = normalizeAngle(ik_solution(i) * 180.0 / M_PI);
+                                target_joints_[i] = static_cast<float>(ik_solution(i) * 180.0 / M_PI);
                             }
                         }
                         
@@ -763,7 +855,11 @@ private:
                     current_joints_ = current;
                 }
                 
-                // 性能监控
+                // 记录数据（原始target_joints，不是filtered）
+                if (data_logging_enabled_) {
+                    logJointData(current, target_joints);
+                }
+                
                 auto loop_end = std::chrono::steady_clock::now();
                 auto loop_duration = std::chrono::duration<double>(loop_end - loop_start).count();
                 loop_times.push_back(loop_duration * 1000.0);
@@ -782,8 +878,8 @@ private:
                     avg /= loop_times.size();
                     
                     RCLCPP_INFO(this->get_logger(), 
-                               "Control loop: avg=%.2fms, max=%.2fms, rate=%.1fHz",
-                               avg, max, 1000.0/avg);
+                               "Control loop: avg=%.2fms, max=%.2fms, rate=%.1fHz, logged=%zu points",
+                               avg, max, 1000.0/avg, logged_data_.size());
                     
                     last_report = loop_end;
                 }
@@ -894,6 +990,13 @@ private:
     std::vector<float> filtered_joint_state_;
     bool filter_initialized_;
     const float filter_alpha_;
+    
+    // 数据记录相关
+    bool data_logging_enabled_;
+    std::string log_file_path_;
+    std::chrono::steady_clock::time_point start_time_;
+    std::mutex log_data_mutex_;
+    std::vector<JointDataPoint> logged_data_;
 };
 
 // ========== Main ==========
@@ -909,6 +1012,7 @@ int main(int argc, char** argv) {
     // 配置
     std::string urdf_path = "/home/ming/xrrobotics_new/XRoboToolkit-Teleop-Sample-Python/assets/arx/Gen/GEN3-7DOF.urdf";
     std::string robot_ip = "192.168.1.10";
+    std::string log_file = "joint_tracking_data.csv";
     
     // 解析命令行参数
     if (argc > 1) {
@@ -917,12 +1021,16 @@ int main(int argc, char** argv) {
     if (argc > 2) {
         urdf_path = argv[2];
     }
+    if (argc > 3) {
+        log_file = argv[3];
+    }
     
     std::cout << "==================================" << std::endl;
     std::cout << "Gen3 XR Teleoperation ROS2 Node" << std::endl;
     std::cout << "==================================" << std::endl;
     std::cout << "Robot IP: " << robot_ip << std::endl;
     std::cout << "URDF: " << urdf_path << std::endl;
+    std::cout << "Log file: " << log_file << std::endl;
     std::cout << std::endl;
     
     try {
