@@ -15,6 +15,8 @@ find_package(kdl_parser REQUIRED)
 find_package(orocos_kdl REQUIRED)
 # TRAC-IK（系统装了 trac_ik_lib 的话）
 find_package(trac_ik_lib QUIET)
+find_package(tf2_ros REQUIRED)
+
 
 # Eigen（有些系统需要）
 find_package(Eigen3 QUIET)
@@ -100,6 +102,7 @@ ament_target_dependencies(gen3_xr_teleop_node
   std_msgs
   geometry_msgs
   kdl_parser
+  tf2_ros
 )
 
 # 链接 TRAC-IK

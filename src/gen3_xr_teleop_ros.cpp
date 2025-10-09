@@ -10,8 +10,10 @@
 
 #include <rclcpp/rclcpp.hpp>
 #include <std_msgs/msg/float32.hpp>
+#include <std_msgs/msg/bool.hpp>
 #include <geometry_msgs/msg/pose_stamped.hpp>
-#include <geometry_msgs/msg/vector3_stamped.hpp>
+#include <geometry_msgs/msg/transform_stamped.hpp>
+#include <tf2_ros/transform_broadcaster.h>
 
 #include <iostream>
 #include <memory>
@@ -78,7 +80,9 @@ public:
           ref_ee_valid_(false),
           ref_controller_valid_(false),
           filter_initialized_(false),
-          filter_alpha_(0.01f)
+          filter_alpha_(0.01f),
+          gripper_control_mode_(0),  // 0: trigger mode, 1: button mode
+          gripper_step_value_(0.1f)
     {
         // 初始化状态向量
         target_joints_.resize(num_joints_, 0.0f);
@@ -93,7 +97,16 @@ public:
         xr_right_grip_ = 0.0f;
         xr_right_trigger_ = 0.0f;
         xr_controller_pose_.resize(7, 0.0);
-        xr_joystick_.resize(2, 0.0);
+        
+        // 初始化按钮状态
+        button_a_state_ = false;
+        button_b_state_ = false;
+        button_x_state_ = false;
+        button_y_state_ = false;
+        button_a_prev_ = false;
+        button_b_prev_ = false;
+        button_x_prev_ = false;
+        button_y_prev_ = false;
         
         // 创建订阅器
         grip_sub_ = this->create_subscription<std_msgs::msg::Float32>(
@@ -108,11 +121,31 @@ public:
             "xr/right_controller_pose", 10,
             std::bind(&Gen3XRTeleopNode::poseCallback, this, std::placeholders::_1));
         
-        joystick_sub_ = this->create_subscription<geometry_msgs::msg::Vector3Stamped>(
-            "xr/right_joystick", 10,
-            std::bind(&Gen3XRTeleopNode::joystickCallback, this, std::placeholders::_1));
+        button_a_sub_ = this->create_subscription<std_msgs::msg::Bool>(
+            "xr/button_a", 10,
+            std::bind(&Gen3XRTeleopNode::buttonACallback, this, std::placeholders::_1));
+        
+        button_b_sub_ = this->create_subscription<std_msgs::msg::Bool>(
+            "xr/button_b", 10,
+            std::bind(&Gen3XRTeleopNode::buttonBCallback, this, std::placeholders::_1));
+        
+        button_x_sub_ = this->create_subscription<std_msgs::msg::Bool>(
+            "xr/button_x", 10,
+            std::bind(&Gen3XRTeleopNode::buttonXCallback, this, std::placeholders::_1));
+        
+        button_y_sub_ = this->create_subscription<std_msgs::msg::Bool>(
+            "xr/button_y", 10,
+            std::bind(&Gen3XRTeleopNode::buttonYCallback, this, std::placeholders::_1));
+        
+        // 创建 TF broadcaster
+        tf_broadcaster_ = std::make_shared<tf2_ros::TransformBroadcaster>(this);
         
         RCLCPP_INFO(this->get_logger(), "Gen3 XR Teleop Node created");
+        RCLCPP_INFO(this->get_logger(), "Gripper control:");
+        RCLCPP_INFO(this->get_logger(), "  - Button A: Toggle control mode (Trigger/Button)");
+        RCLCPP_INFO(this->get_logger(), "  - Button B: Cycle step value (0.1/0.01/0.001/0.0001)");
+        RCLCPP_INFO(this->get_logger(), "  - Button X: Increase gripper (in button mode)");
+        RCLCPP_INFO(this->get_logger(), "  - Button Y: Decrease gripper (in button mode)");
     }
     
     ~Gen3XRTeleopNode() {
@@ -211,10 +244,24 @@ private:
         xr_controller_pose_[6] = msg->pose.orientation.w;
     }
     
-    void joystickCallback(const geometry_msgs::msg::Vector3Stamped::SharedPtr msg) {
+    void buttonACallback(const std_msgs::msg::Bool::SharedPtr msg) {
         std::lock_guard<std::mutex> lock(xr_data_mutex_);
-        xr_joystick_[0] = msg->vector.x;
-        xr_joystick_[1] = msg->vector.y;
+        button_a_state_ = msg->data;
+    }
+    
+    void buttonBCallback(const std_msgs::msg::Bool::SharedPtr msg) {
+        std::lock_guard<std::mutex> lock(xr_data_mutex_);
+        button_b_state_ = msg->data;
+    }
+    
+    void buttonXCallback(const std_msgs::msg::Bool::SharedPtr msg) {
+        std::lock_guard<std::mutex> lock(xr_data_mutex_);
+        button_x_state_ = msg->data;
+    }
+    
+    void buttonYCallback(const std_msgs::msg::Bool::SharedPtr msg) {
+        std::lock_guard<std::mutex> lock(xr_data_mutex_);
+        button_y_state_ = msg->data;
     }
     
     // ========== 初始化函数 ==========
@@ -235,7 +282,7 @@ private:
                 return false;
             }
             
-            auto positions = normalizeAngles(robot_controller_->getJointPositions());//要确认拿到的角度是degree的，可以在robot initialize的时候看看输出。
+            auto positions = normalizeAngles(robot_controller_->getJointPositions());
             {
                 std::lock_guard<std::mutex> lock(state_mutex_);
                 current_joints_ = positions;
@@ -397,6 +444,45 @@ private:
         quat = Eigen::Quaterniond(w, x, y, z);
     }
     
+    void publishTF(const KDL::Frame& current_frame, const KDL::Frame& target_frame) {
+        auto now = this->get_clock()->now();
+        
+        // 发布 current frame
+        geometry_msgs::msg::TransformStamped current_tf;
+        current_tf.header.stamp = now;
+        current_tf.header.frame_id = "world";
+        current_tf.child_frame_id = "ee_current";
+        current_tf.transform.translation.x = current_frame.p.x();
+        current_tf.transform.translation.y = current_frame.p.y();
+        current_tf.transform.translation.z = current_frame.p.z();
+        
+        double x, y, z, w;
+        current_frame.M.GetQuaternion(x, y, z, w);
+        current_tf.transform.rotation.x = x;
+        current_tf.transform.rotation.y = y;
+        current_tf.transform.rotation.z = z;
+        current_tf.transform.rotation.w = w;
+        
+        tf_broadcaster_->sendTransform(current_tf);
+        
+        // 发布 target frame
+        geometry_msgs::msg::TransformStamped target_tf;
+        target_tf.header.stamp = now;
+        target_tf.header.frame_id = "world";
+        target_tf.child_frame_id = "ee_target";
+        target_tf.transform.translation.x = target_frame.p.x();
+        target_tf.transform.translation.y = target_frame.p.y();
+        target_tf.transform.translation.z = target_frame.p.z();
+        
+        target_frame.M.GetQuaternion(x, y, z, w);
+        target_tf.transform.rotation.x = x;
+        target_tf.transform.rotation.y = y;
+        target_tf.transform.rotation.z = z;
+        target_tf.transform.rotation.w = w;
+        
+        tf_broadcaster_->sendTransform(target_tf);
+    }
+    
     // ========== 线程函数 ==========
     
     void ikThread() {
@@ -409,18 +495,75 @@ private:
             try {
                 // 获取 XR 输入（带锁）
                 float grip_value, trigger_value;
+                bool button_a, button_b, button_x, button_y;
                 std::vector<double> controller_pose;
                 {
                     std::lock_guard<std::mutex> lock(xr_data_mutex_);
                     grip_value = xr_right_grip_;
                     trigger_value = xr_right_trigger_;
                     controller_pose = xr_controller_pose_;
+                    button_a = button_a_state_;
+                    button_b = button_b_state_;
+                    button_x = button_x_state_;
+                    button_y = button_y_state_;
+                }
+                
+                // 处理按钮 A：切换控制模式
+                if (button_a && !button_a_prev_) {
+                    gripper_control_mode_ = 1 - gripper_control_mode_;
+                    RCLCPP_INFO(this->get_logger(), "Gripper control mode: %s",
+                               gripper_control_mode_ == 0 ? "TRIGGER" : "BUTTON");
+                }
+                button_a_prev_ = button_a;
+                
+                // 处理按钮 B：切换步进值
+                if (button_b && !button_b_prev_) {
+                    if (gripper_step_value_ == 0.1f) {
+                        gripper_step_value_ = 0.01f;
+                    } else if (gripper_step_value_ == 0.01f) {
+                        gripper_step_value_ = 0.001f;
+                    } else if (gripper_step_value_ == 0.001f) {
+                        gripper_step_value_ = 0.0001f;
+                    } else {
+                        gripper_step_value_ = 0.1f;
+                    }
+                    RCLCPP_INFO(this->get_logger(), "Gripper step value: %.4f", gripper_step_value_);
+                }
+                button_b_prev_ = button_b;
+                
+                // 更新夹爪目标
+                float new_gripper_target;
+                {
+                    std::lock_guard<std::mutex> lock(state_mutex_);
+                    new_gripper_target = target_gripper_;
+                }
+                
+                if (gripper_control_mode_ == 0) {
+                    // Trigger 模式：直接使用 trigger 值
+                    new_gripper_target = std::max(0.0f, std::min(1.0f, trigger_value));
+                } else {
+                    // Button 模式：使用 X/Y 按钮增减
+                    // 处理按钮 X：增加
+                    if (button_x && !button_x_prev_) {
+                        new_gripper_target += gripper_step_value_;
+                        new_gripper_target = std::max(0.0f, std::min(1.0f, new_gripper_target));
+                        RCLCPP_INFO(this->get_logger(), "Gripper target: %.4f (increased)", new_gripper_target);
+                    }
+                    button_x_prev_ = button_x;
+                    
+                    // 处理按钮 Y：减少
+                    if (button_y && !button_y_prev_) {
+                        new_gripper_target -= gripper_step_value_;
+                        new_gripper_target = std::max(0.0f, std::min(1.0f, new_gripper_target));
+                        RCLCPP_INFO(this->get_logger(), "Gripper target: %.4f (decreased)", new_gripper_target);
+                    }
+                    button_y_prev_ = button_y;
                 }
                 
                 // 更新夹爪目标
                 {
                     std::lock_guard<std::mutex> lock(state_mutex_);
-                    target_gripper_ = std::max(0.0f, std::min(1.0f, trigger_value));
+                    target_gripper_ = new_gripper_target;
                 }
                 
                 // 检查激活状态
@@ -447,9 +590,13 @@ private:
                         }
                     }
                     
+                    // 计算当前 end effector frame
+                    KDL::Frame current_ee_frame;
+                    fk_solver_->JntToCart(current_joints_kdl, current_ee_frame);
+                    
                     // 初始化参考坐标系
                     if (!ref_ee_valid_) {
-                        fk_solver_->JntToCart(current_joints_kdl, ref_ee_frame_);
+                        ref_ee_frame_ = current_ee_frame;
                         ref_ee_valid_ = true;
                     }
                     
@@ -490,6 +637,9 @@ private:
                             RCLCPP_WARN(this->get_logger(), "IK solution not found");
                         }
                     }
+                    
+                    // 发布 TF
+                    publishTF(current_ee_frame, target_frame);
                 }
                 
             } catch (const std::exception& e) {
@@ -615,14 +765,29 @@ private:
     rclcpp::Subscription<std_msgs::msg::Float32>::SharedPtr grip_sub_;
     rclcpp::Subscription<std_msgs::msg::Float32>::SharedPtr trigger_sub_;
     rclcpp::Subscription<geometry_msgs::msg::PoseStamped>::SharedPtr pose_sub_;
-    rclcpp::Subscription<geometry_msgs::msg::Vector3Stamped>::SharedPtr joystick_sub_;
+    rclcpp::Subscription<std_msgs::msg::Bool>::SharedPtr button_a_sub_;
+    rclcpp::Subscription<std_msgs::msg::Bool>::SharedPtr button_b_sub_;
+    rclcpp::Subscription<std_msgs::msg::Bool>::SharedPtr button_x_sub_;
+    rclcpp::Subscription<std_msgs::msg::Bool>::SharedPtr button_y_sub_;
+    
+    // TF broadcaster
+    std::shared_ptr<tf2_ros::TransformBroadcaster> tf_broadcaster_;
     
     // XR 数据（受 xr_data_mutex_ 保护）
     std::mutex xr_data_mutex_;
     float xr_right_grip_;
     float xr_right_trigger_;
     std::vector<double> xr_controller_pose_;
-    std::vector<double> xr_joystick_;
+    
+    // 按钮状态
+    bool button_a_state_;
+    bool button_b_state_;
+    bool button_x_state_;
+    bool button_y_state_;
+    bool button_a_prev_;
+    bool button_b_prev_;
+    bool button_x_prev_;
+    bool button_y_prev_;
     
     // 线程控制
     std::atomic<bool> shutdown_requested_;
@@ -635,6 +800,10 @@ private:
     
     // 控制状态
     std::atomic<bool> is_active_;
+    
+    // 夹爪控制
+    int gripper_control_mode_;  // 0: trigger, 1: button
+    float gripper_step_value_;
     
     // 参考坐标系
     bool ref_ee_valid_;

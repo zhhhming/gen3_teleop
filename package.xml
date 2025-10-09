@@ -17,6 +17,7 @@
   <depend>kdl_parser</depend>
   <depend>orocos_kdl</depend>
   <depend>trac_ik_lib</depend>
+  <depend>tf2_ros</depend>
 
   <!-- Python XR 发布器 -->
   <exec_depend>rclpy</exec_depend>

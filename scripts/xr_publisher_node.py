@@ -7,8 +7,8 @@ XR Publisher Node
 
 import rclpy
 from rclpy.node import Node
-from std_msgs.msg import Float32
-from geometry_msgs.msg import PoseStamped, Vector3Stamped
+from std_msgs.msg import Float32, Bool
+from geometry_msgs.msg import PoseStamped
 import numpy as np
 import sys
 
@@ -45,14 +45,32 @@ class XRPublisherNode(Node):
             10
         )
         
-        self.right_joystick_pub = self.create_publisher(
-            Vector3Stamped,
-            'xr/right_joystick',
+        # 添加按钮发布器
+        self.button_a_pub = self.create_publisher(
+            Bool,
+            'xr/button_a',
+            10
+        )
+        
+        self.button_b_pub = self.create_publisher(
+            Bool,
+            'xr/button_b',
+            10
+        )
+        
+        self.button_x_pub = self.create_publisher(
+            Bool,
+            'xr/button_x',
+            10
+        )
+        
+        self.button_y_pub = self.create_publisher(
+            Bool,
+            'xr/button_y',
             10
         )
         
         # 创建定时器：250Hz (4ms)
-        # 可以根据需要调整频率，但不建议超过 500Hz
         self.publish_rate = 250  # Hz
         timer_period = 1.0 / self.publish_rate
         self.timer = self.create_timer(timer_period, self.publish_callback)
@@ -62,7 +80,10 @@ class XRPublisherNode(Node):
         self.get_logger().info('  - /xr/right_grip (Float32)')
         self.get_logger().info('  - /xr/right_trigger (Float32)')
         self.get_logger().info('  - /xr/right_controller_pose (PoseStamped)')
-        self.get_logger().info('  - /xr/right_joystick (Vector3Stamped)')
+        self.get_logger().info('  - /xr/button_a (Bool)')
+        self.get_logger().info('  - /xr/button_b (Bool)')
+        self.get_logger().info('  - /xr/button_x (Bool)')
+        self.get_logger().info('  - /xr/button_y (Bool)')
     
     def _init_xr_sdk(self):
         """初始化 XR SDK"""
@@ -105,16 +126,22 @@ class XRPublisherNode(Node):
             
             self.right_controller_pose_pub.publish(pose_msg)
             
-            # 4. 发布右手摇杆状态
-            joystick = xrt.get_right_axis()
-            joystick_msg = Vector3Stamped()
-            joystick_msg.header.stamp = timestamp
-            joystick_msg.header.frame_id = 'right_controller'
-            joystick_msg.vector.x = float(joystick[0])
-            joystick_msg.vector.y = float(joystick[1])
-            joystick_msg.vector.z = 0.0
+            # 4. 发布按钮状态
+            button_a_msg = Bool()
+            button_a_msg.data = bool(xrt.get_A_button())
+            self.button_a_pub.publish(button_a_msg)
             
-            self.right_joystick_pub.publish(joystick_msg)
+            button_b_msg = Bool()
+            button_b_msg.data = bool(xrt.get_B_button())
+            self.button_b_pub.publish(button_b_msg)
+            
+            button_x_msg = Bool()
+            button_x_msg.data = bool(xrt.get_X_button())
+            self.button_x_pub.publish(button_x_msg)
+            
+            button_y_msg = Bool()
+            button_y_msg.data = bool(xrt.get_Y_button())
+            self.button_y_pub.publish(button_y_msg)
             
         except Exception as e:
             self.get_logger().error(f"Error publishing XR data: {str(e)}")
