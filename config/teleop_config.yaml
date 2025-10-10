@@ -1,0 +1,12 @@
+teleop:
+  robot_ip: "192.168.1.10"
+  urdf_path: "/home/ming/xrrobotics_new/XRoboToolkit-Teleop-Sample-Python/assets/arx/Gen/GEN3-7DOF.urdf"
+  log_file: "joint_tracking_data.csv"
+
+xr_publisher:
+  publish_rate: 200.0
+  frame_id: "vr_origin"
+
+rviz:
+  enabled: true
+  config: "rviz/rviz.rviz"

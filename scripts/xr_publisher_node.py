@@ -23,6 +23,10 @@ class XRPublisherNode(Node):
     def __init__(self):
         super().__init__('xr_publisher_node')
         
+        # 声明可配置参数
+        self.declare_parameter('publish_rate', 200.0)
+        self.declare_parameter('frame_id', 'vr_origin')
+
         # 初始化 XR SDK
         self._init_xr_sdk()
         
@@ -70,12 +74,20 @@ class XRPublisherNode(Node):
             10
         )
         
-        # 创建定时器：250Hz (4ms)
-        self.publish_rate = 200  # Hz
+        # 读取参数配置
+        self.publish_rate = float(self.get_parameter('publish_rate').value)
+        if self.publish_rate <= 0.0:
+            self.get_logger().warn('publish_rate <= 0, falling back to 200 Hz')
+            self.publish_rate = 200.0
+        self.frame_id = str(self.get_parameter('frame_id').value)
+        if not self.frame_id:
+            self.frame_id = 'vr_origin'
+
         timer_period = 1.0 / self.publish_rate
         self.timer = self.create_timer(timer_period, self.publish_callback)
         
         self.get_logger().info(f'XR Publisher Node started at {self.publish_rate}Hz')
+        self.get_logger().info(f'Publishing pose in frame: {self.frame_id}')
         self.get_logger().info('Publishing topics:')
         self.get_logger().info('  - /xr/right_grip (Float32)')
         self.get_logger().info('  - /xr/right_trigger (Float32)')
@@ -113,7 +125,7 @@ class XRPublisherNode(Node):
             pose_array = xrt.get_right_controller_pose()
             pose_msg = PoseStamped()
             pose_msg.header.stamp = timestamp
-            pose_msg.header.frame_id = 'vr_origin'
+            pose_msg.header.frame_id = self.frame_id
             
             # pose_array: [x, y, z, qx, qy, qz, qw]
             pose_msg.pose.position.x = float(pose_array[0])
