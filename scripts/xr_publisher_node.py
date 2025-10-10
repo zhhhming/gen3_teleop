@@ -71,7 +71,7 @@ class XRPublisherNode(Node):
         )
         
         # 创建定时器：250Hz (4ms)
-        self.publish_rate = 250  # Hz
+        self.publish_rate = 200  # Hz
         timer_period = 1.0 / self.publish_rate
         self.timer = self.create_timer(timer_period, self.publish_callback)
         
