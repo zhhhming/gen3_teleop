@@ -1,5 +1,5 @@
 /**
- * Gen3 XR Teleoperation ROS2 Node with Data Logging
+ * Gen3 XR Teleoperation ROS2 Node with Data Logging and Overrun Compensation
  * 订阅 XR 数据话题，实时控制 Kinova Gen3 机械臂，并记录位置数据
  */
 
@@ -68,8 +68,14 @@ struct JointDataPoint {
     std::vector<float> differences;        // 差值（°）
 };
 
+// Pose历史数据结构
+struct PoseHistoryEntry {
+    std::chrono::steady_clock::time_point timestamp;
+    std::vector<double> pose;  // 7个元素：x,y,z,qx,qy,qz,qw
+};
+
 /**
- * ROS2 节点：Gen3 XR 遥操作控制器（带数据记录）
+ * ROS2 节点：Gen3 XR 遥操作控制器（带数据记录和超时补偿）
  */
 class Gen3XRTeleopNode : public rclcpp::Node {
 public:
@@ -97,7 +103,11 @@ public:
           gripper_control_mode_(0),  // 0: trigger mode, 1: button mode
           gripper_step_value_(0.1f),
           gripper_button_repeat_interval_(0.1),
-          data_logging_enabled_(false)  // 默认关闭数据记录
+          data_logging_enabled_(false),  // 默认关闭数据记录
+          overrun_time_ms_(0.0),  // 超时补偿时间（毫秒）
+          catchup_rate_ms_(30.0),  // 追赶速率（毫秒/循环）
+          max_pose_history_(1000),  // 最大历史记录数
+          xr_data_rate_ms_(5.0)  // XR数据频率（5ms = 200Hz）
     {
         // 初始化状态向量
         target_joints_.resize(num_joints_, 0.0f);
@@ -166,6 +176,7 @@ public:
         RCLCPP_INFO(this->get_logger(), "Data logging: %s",
                    data_logging_enabled_ ? "ENABLED" : "DISABLED");
         RCLCPP_INFO(this->get_logger(), "Log file: %s", log_file_path_.c_str());
+        RCLCPP_INFO(this->get_logger(), "Overrun compensation: catchup_rate=%.1fms/cycle", catchup_rate_ms_);
         RCLCPP_INFO(this->get_logger(), "Gripper control:");
         RCLCPP_INFO(this->get_logger(), "  - Button A: Toggle control mode (Trigger/Button)");
         RCLCPP_INFO(this->get_logger(), "  - Button B: Cycle step value (0.1/0.01/0.001/0.0001)");
@@ -266,6 +277,8 @@ private:
 
     void poseCallback(const geometry_msgs::msg::PoseStamped::SharedPtr msg) {
         std::lock_guard<std::mutex> lock(xr_data_mutex_);
+        
+        // 更新当前pose
         xr_controller_pose_[0] = msg->pose.position.x;
         xr_controller_pose_[1] = msg->pose.position.y;
         xr_controller_pose_[2] = msg->pose.position.z;
@@ -273,6 +286,18 @@ private:
         xr_controller_pose_[4] = msg->pose.orientation.y;
         xr_controller_pose_[5] = msg->pose.orientation.z;
         xr_controller_pose_[6] = msg->pose.orientation.w;
+        
+        // 添加到历史队列
+        PoseHistoryEntry entry;
+        entry.timestamp = std::chrono::steady_clock::now();
+        entry.pose = xr_controller_pose_;
+        
+        pose_history_.push_back(entry);
+        
+        // 限制队列大小
+        while (pose_history_.size() > max_pose_history_) {
+            pose_history_.pop_front();
+        }
     }
 
     void buttonACallback(const std_msgs::msg::Bool::SharedPtr msg) {
@@ -437,6 +462,38 @@ private:
         return filtered;
     }
 
+    // 根据超时补偿获取历史pose
+    std::vector<double> getPoseWithCompensation() {
+        std::lock_guard<std::mutex> lock(xr_data_mutex_);
+        
+        // 如果历史队列为空，返回当前值
+        if (pose_history_.empty()) {
+            return xr_controller_pose_;
+        }
+        
+        // 读取 atomic 变量
+        double overrun_ms = overrun_time_ms_.load();
+        
+        // 如果没有超时，返回最新值
+        if (overrun_ms <= 0.0) {
+            return pose_history_.back().pose;
+        }
+        
+        // 计算需要回溯的步数
+        int steps_back = static_cast<int>(overrun_ms / xr_data_rate_ms_);
+        
+        // 限制在有效范围内
+        int history_index = static_cast<int>(pose_history_.size()) - 1 - steps_back;
+        history_index = std::max(0, history_index);
+        
+        // 输出追赶信息
+        RCLCPP_INFO_THROTTLE(this->get_logger(), *this->get_clock(), 500,  // 每500ms最多输出一次
+                            "Catching up: overrun_time=%.1fms, steps_back=%d, using index=%d/%zu",
+                            overrun_ms, steps_back, history_index, pose_history_.size());
+        
+        return pose_history_[history_index].pose;
+    }
+
     void processControllerPose(const std::vector<double>& xr_pose,
                               Eigen::Vector3d& delta_pos,
                               Eigen::Vector3d& delta_rot) {
@@ -593,14 +650,25 @@ private:
     // ========== 线程函数 ==========
 
     void ikThread() {
-        RCLCPP_INFO(this->get_logger(), "IK thread started");
+        RCLCPP_INFO(this->get_logger(), "IK thread started at %dHz", ik_rate_hz_);
         auto dt = std::chrono::duration<double>(1.0 / ik_rate_hz_);
+        
+        // 性能统计变量
+        std::deque<double> ik_loop_times;
+        const size_t max_samples = 100;  // IK线程频率低，采样少一些
+        auto last_report = std::chrono::steady_clock::now();
+        const double overrun_threshold_ms = 40.0;  // 严重超时阈值（毫秒）
 
         while (!shutdown_requested_ && !g_shutdown_requested) {
             auto loop_start = std::chrono::steady_clock::now();
 
             try {
-                // 获取 XR 输入（带锁）
+                // 更新超时补偿时间（每循环减少，最小为0）
+                double current_overrun = overrun_time_ms_.load();
+                double new_overrun = std::max(0.0, current_overrun - catchup_rate_ms_);
+                overrun_time_ms_.store(new_overrun);
+                
+                // 获取 XR 输入（带补偿的pose）
                 float grip_value, trigger_value;
                 bool button_a, button_b, button_x, button_y;
                 std::vector<double> controller_pose;
@@ -608,12 +676,14 @@ private:
                     std::lock_guard<std::mutex> lock(xr_data_mutex_);
                     grip_value = xr_right_grip_;
                     trigger_value = xr_right_trigger_;
-                    controller_pose = xr_controller_pose_;
                     button_a = button_a_state_;
                     button_b = button_b_state_;
                     button_x = button_x_state_;
                     button_y = button_y_state_;
                 }
+                
+                // 根据超时补偿获取pose
+                controller_pose = getPoseWithCompensation();
 
                 // 处理按钮 A：切换控制模式
                 if (button_a && !button_a_prev_) {
@@ -782,7 +852,7 @@ private:
                         {
                             std::lock_guard<std::mutex> lock(state_mutex_);
                             for (int i = 0; i < num_joints_; ++i) {
-                                // 直接以“度”存储（不再做 ±180 归一化），便于连续关节跨圈
+                                // 直接以"度"存储（不再做 ±180 归一化），便于连续关节跨圈
                                 target_joints_[i] = static_cast<float>(ik_solution(i) * 180.0 / M_PI);
                             }
                         }
@@ -804,6 +874,42 @@ private:
                 {
                     std::lock_guard<std::mutex> lock(frame_mutex_);
                     publishTF(current_ee_frame_, target_ee_frame_);
+                }
+
+                // 性能统计和超时检测
+                auto loop_end = std::chrono::steady_clock::now();
+                auto loop_duration_ms = std::chrono::duration<double, std::milli>(loop_end - loop_start).count();
+                
+                // 记录循环时间
+                ik_loop_times.push_back(loop_duration_ms);
+                if (ik_loop_times.size() > max_samples) {
+                    ik_loop_times.pop_front();
+                }
+                
+                // 检测严重超时
+                if (loop_duration_ms > overrun_threshold_ms) {
+                    double overrun_ms = loop_duration_ms - 20.0;  // 超过期望周期的时间
+                    double current_overrun = overrun_time_ms_.load();
+                    overrun_time_ms_.store(current_overrun + overrun_ms);
+                    RCLCPP_WARN(this->get_logger(), 
+                               "IK loop OVERRUN: duration=%.2fms, overrun=%.2fms, total_overrun=%.2fms",
+                               loop_duration_ms, overrun_ms, current_overrun + overrun_ms);
+                }
+                
+                // 定期报告性能
+                if (loop_end - last_report > std::chrono::seconds(2)) {
+                    double avg = 0, maxv = 0;
+                    for (double t : ik_loop_times) {
+                        avg += t;
+                        maxv = std::max(maxv, t);
+                    }
+                    avg /= ik_loop_times.size();
+                    
+                    RCLCPP_INFO(this->get_logger(),
+                               "IK loop: avg=%.2fms, max=%.2fms, rate=%.1fHz, overrun_time=%.1fms",
+                               avg, maxv, 1000.0/avg, overrun_time_ms_.load());
+                    
+                    last_report = loop_end;
                 }
 
             } catch (const std::exception& e) {
@@ -829,7 +935,7 @@ private:
         const size_t max_samples = 1000;
         auto last_report = std::chrono::steady_clock::now();
 
-        // 期望的“最大角速度” (°/s)。可按实际需求调参或做成每关节数组。
+        // 期望的"最大角速度" (°/s)。可按实际需求调参或做成每关节数组。
         const float max_step_deg  = 0.8f;
 
         while (!shutdown_requested_ && !g_shutdown_requested) {
@@ -845,7 +951,7 @@ private:
                     target_gripper = target_gripper_;
                 }
 
-                // 应用低通滤波（保持“展开”到最近参考）
+                // 应用低通滤波（保持"展开"到最近参考）
                 std::vector<float> filtered_joints = filterJointPositions(target_joints);
 
                 // 读取当前关节（度）作为限幅参考
@@ -967,6 +1073,7 @@ private:
     float xr_right_grip_;
     float xr_right_trigger_;
     std::vector<double> xr_controller_pose_;
+    std::deque<PoseHistoryEntry> pose_history_;  // Pose历史队列
 
     // 按钮状态
     bool button_a_state_;
@@ -988,7 +1095,7 @@ private:
 
     // 机械臂状态（受 state_mutex_ 保护）
     std::mutex state_mutex_;
-    std::vector<float> target_joints_;   // 目标关节角（°，可超±180 做“展开”）
+    std::vector<float> target_joints_;   // 目标关节角（°，可超±180 做"展开"）
     std::vector<float> current_joints_;  // 当前关节角（°，normalizeAngles 后）
 
     float target_gripper_;
@@ -1027,6 +1134,12 @@ private:
     std::chrono::steady_clock::time_point start_time_;
     std::mutex log_data_mutex_;
     std::vector<JointDataPoint> logged_data_;
+
+    // 超时补偿相关
+    std::atomic<double> overrun_time_ms_;  // 累积超时时间（毫秒）
+    double catchup_rate_ms_;  // 追赶速率（毫秒/循环）
+    size_t max_pose_history_;  // 最大历史记录数
+    double xr_data_rate_ms_;  // XR数据周期（毫秒）
 };
 
 // ========== Main ==========
