@@ -108,6 +108,8 @@ class XRPublisherNode(Node):
     
     def publish_callback(self):
         """定时器回调：发布所有 XR 数据"""
+        if not rclpy.ok():
+            return
         try:
             timestamp = self.get_clock().now().to_msg()
             
@@ -162,9 +164,15 @@ class XRPublisherNode(Node):
         """清理资源"""
         try:
             xrt.close()
-            self.get_logger().info('XR SDK closed successfully')
+            if rclpy.ok():
+                self.get_logger().info('XR SDK closed successfully')
+            else:
+                print('[xr_publisher_node] XR SDK closed successfully')
         except Exception as e:
-            self.get_logger().error(f'Error closing XR SDK: {str(e)}')
+            if rclpy.ok():
+                self.get_logger().error(f'Error closing XR SDK: {str(e)}')
+            else:
+                print(f'[xr_publisher_node] Error closing XR SDK: {e}')
         super().destroy_node()
 
 
@@ -177,12 +185,16 @@ def main(args=None):
     except KeyboardInterrupt:
         pass
     except Exception as e:
-        print(f"Error in XR Publisher Node: {e}")
+        print(f"[xr_publisher_node] Error in XR Publisher Node: {e}")
     finally:
-        if 'node' in locals():
+        if node is not None:
             node.destroy_node()
-        rclpy.shutdown()
-
+        # 只在还未关闭时调用 shutdown，避免 “already called” 异常
+        if rclpy.ok():
+            try:
+                rclpy.shutdown()
+            except Exception:
+                pass
 
 if __name__ == '__main__':
     main()
