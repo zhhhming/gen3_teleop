@@ -20,9 +20,9 @@
 
 // ANSI颜色代码
 #define COLOR_RESET   "\033[0m"
-#define COLOR_GREEN   "\033[32m"
-#define COLOR_BLUE    "\033[34m"
-#define COLOR_CYAN    "\033[36m"
+#define COLOR_GREEN   "\033[92m"
+#define COLOR_BLUE    "\033[31m"
+#define COLOR_CYAN    "\033[96m"
 
 // 全局关闭标志
 std::atomic<bool> g_shutdown_requested{false};
@@ -292,8 +292,6 @@ private:
             } else {
                 // 已经初始化，可以切换log_enable_
                 log_enable_ = !log_enable_;
-                RCLCPP_INFO(this->get_logger(), "Left trigger pressed: Recording %s", 
-                           log_enable_ ? "STARTED" : "STOPPED");
             }
         }
     }
@@ -430,9 +428,11 @@ private:
                     // 如果启用unwrap，对target_joints进行unwrap处理
                     if (enable_unwrap_) {
                         for (int i = 0; i < num_joints_; ++i) {
+                            joints_current_copy[i] = unwrap(joints_current_copy[i], reference_joints_[i]);
+                            reference_joints_[i] = joints_current_copy[i];
                             joints_target_copy[i] = unwrap(joints_target_copy[i], reference_joints_[i]);
                             // 更新reference为unwrapped后的值
-                            reference_joints_[i] = joints_target_copy[i];
+                            
                         }
                     }
                 }
@@ -602,7 +602,7 @@ private:
                 }
                 
                 // 使用\r实现同行刷新显示当前帧数（不会刷屏），Frame数字用青色
-                std::cout << "\rEpisode " << episode_count_.load() << " | Frame: " 
+                std::cout << "\rEpisode " << COLOR_GREEN << episode_count_.load() << COLOR_RESET << " | Frame: " 
                           << COLOR_CYAN << data_index << COLOR_RESET << std::flush;
                 
                 data_index++;
@@ -630,7 +630,7 @@ private:
             RCLCPP_INFO(this->get_logger(), "===================================================");
         }
         if (g_shutdown_requested) {
-            RCLCPP_INFO(node->get_logger(), "Interrupt signal received. Shutting down...");
+            RCLCPP_INFO(this->get_logger(), "Interrupt signal received. Shutting down...");
         }
 
         logger_running_ = false;
