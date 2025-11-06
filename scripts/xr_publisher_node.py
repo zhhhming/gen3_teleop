@@ -30,7 +30,7 @@ class XRPublisherNode(Node):
         # 初始化 XR SDK
         self._init_xr_sdk()
         
-        # 创建发布器
+        # 创建发布器 - 右手
         self.right_grip_pub = self.create_publisher(
             Float32, 
             'xr/right_grip', 
@@ -40,6 +40,19 @@ class XRPublisherNode(Node):
         self.right_trigger_pub = self.create_publisher(
             Float32, 
             'xr/right_trigger', 
+            10
+        )
+        
+        # 创建发布器 - 左手
+        self.left_grip_pub = self.create_publisher(
+            Float32, 
+            'xr/left_grip', 
+            10
+        )
+        
+        self.left_trigger_pub = self.create_publisher(
+            Float32, 
+            'xr/left_trigger', 
             10
         )
         
@@ -91,6 +104,8 @@ class XRPublisherNode(Node):
         self.get_logger().info('Publishing topics:')
         self.get_logger().info('  - /xr/right_grip (Float32)')
         self.get_logger().info('  - /xr/right_trigger (Float32)')
+        self.get_logger().info('  - /xr/left_grip (Float32)')
+        self.get_logger().info('  - /xr/left_trigger (Float32)')
         self.get_logger().info('  - /xr/right_controller_pose (PoseStamped)')
         self.get_logger().info('  - /xr/button_a (Bool)')
         self.get_logger().info('  - /xr/button_b (Bool)')
@@ -123,7 +138,17 @@ class XRPublisherNode(Node):
             trigger_msg.data = float(xrt.get_right_trigger())
             self.right_trigger_pub.publish(trigger_msg)
             
-            # 3. 发布右手控制器姿态
+            # 3. 发布左手握持值
+            left_grip_msg = Float32()
+            left_grip_msg.data = float(xrt.get_left_grip())
+            self.left_grip_pub.publish(left_grip_msg)
+            
+            # 4. 发布左手扳机值
+            left_trigger_msg = Float32()
+            left_trigger_msg.data = float(xrt.get_left_trigger())
+            self.left_trigger_pub.publish(left_trigger_msg)
+            
+            # 5. 发布右手控制器姿态
             pose_array = xrt.get_right_controller_pose()
             pose_msg = PoseStamped()
             pose_msg.header.stamp = timestamp
@@ -140,7 +165,7 @@ class XRPublisherNode(Node):
             
             self.right_controller_pose_pub.publish(pose_msg)
             
-            # 4. 发布按钮状态
+            # 6. 发布按钮状态
             button_a_msg = Bool()
             button_a_msg.data = bool(xrt.get_A_button())
             self.button_a_pub.publish(button_a_msg)
@@ -189,7 +214,7 @@ def main(args=None):
     finally:
         if node is not None:
             node.destroy_node()
-        # 只在还未关闭时调用 shutdown，避免 “already called” 异常
+        # 只在还未关闭时调用 shutdown，避免 "already called" 异常
         if rclpy.ok():
             try:
                 rclpy.shutdown()
