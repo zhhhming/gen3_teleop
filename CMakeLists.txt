@@ -10,6 +10,7 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 find_package(ament_cmake REQUIRED)
 find_package(rclcpp REQUIRED)
 find_package(std_msgs REQUIRED)
+find_package(sensor_msgs REQUIRED)
 find_package(geometry_msgs REQUIRED)
 find_package(kdl_parser REQUIRED)
 find_package(orocos_kdl REQUIRED)
@@ -100,6 +101,7 @@ target_include_directories(gen3_xr_teleop_node PRIVATE
 ament_target_dependencies(gen3_xr_teleop_node
   rclcpp
   std_msgs
+  sensor_msgs
   geometry_msgs
   kdl_parser
   tf2_ros

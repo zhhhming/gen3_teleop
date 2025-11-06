@@ -1,7 +1,7 @@
 /**
  * Gen3 XR Teleoperation ROS2 Node (Simplified Version with Home Function)
  * 订阅 XR 数据话题，实时控制 Kinova Gen3 机械臂
- * 新增功能：Left Grip控制的回零功能
+ * 新增功能：Left Grip控制的回零功能 + 关节和夹爪状态发布
  */
 
 #include <rclcpp/rclcpp.hpp>
@@ -9,6 +9,7 @@
 #include <std_msgs/msg/bool.hpp>
 #include <geometry_msgs/msg/pose_stamped.hpp>
 #include <geometry_msgs/msg/transform_stamped.hpp>
+#include <sensor_msgs/msg/joint_state.hpp>
 #include <tf2_ros/transform_broadcaster.h>
 
 #include <iostream>
@@ -60,7 +61,7 @@ void signal_handler(int sig) {
 }
 
 /**
- * ROS2 节点：Gen3 XR 遥操作控制器（精简版 + Home功能）
+ * ROS2 节点：Gen3 XR 遥操作控制器（精简版 + Home功能 + 状态发布）
  */
 class Gen3XRTeleopNode : public rclcpp::Node {
 public:
@@ -158,6 +159,13 @@ public:
             "xr/button_y", 10,
             std::bind(&Gen3XRTeleopNode::buttonYCallback, this, std::placeholders::_1));
 
+        // 创建状态发布器
+        current_joint_states_pub_ = this->create_publisher<sensor_msgs::msg::JointState>(
+            "/gen3/current_joint_states", 10);
+        
+        target_joint_states_pub_ = this->create_publisher<sensor_msgs::msg::JointState>(
+            "/gen3/target_joint_states", 10);
+
         // 创建 TF broadcaster
         tf_broadcaster_ = std::make_shared<tf2_ros::TransformBroadcaster>(this);
 
@@ -170,6 +178,9 @@ public:
         RCLCPP_INFO(this->get_logger(), "  - Hold button: Repeat every 0.1s");
         RCLCPP_INFO(this->get_logger(), "Home control:");
         RCLCPP_INFO(this->get_logger(), "  - Left Grip: Toggle home mode (move to zero position)");
+        RCLCPP_INFO(this->get_logger(), "State publishing:");
+        RCLCPP_INFO(this->get_logger(), "  - /gen3/current_joint_states: Current joints and gripper");
+        RCLCPP_INFO(this->get_logger(), "  - /gen3/target_joint_states: Target joints and gripper");
     }
 
     ~Gen3XRTeleopNode() {
@@ -317,6 +328,8 @@ private:
                 std::lock_guard<std::mutex> lock(state_mutex_);
                 current_joints_ = positions;
                 target_joints_ = positions;
+                current_gripper_ = robot_controller_->getGripperPosition() / 100.0f;
+                target_gripper_ = current_gripper_;
             }
 
             initializeFilterState(positions);
@@ -512,6 +525,53 @@ private:
         target_tf.transform.rotation.w = w;
 
         tf_broadcaster_->sendTransform(target_tf);
+    }
+
+    // ========== 状态发布函数 ==========
+
+    void publishJointStates(const KDL::JntArray& current_joints_kdl,
+                           const std::vector<float>& target_joints_vec,
+                           float current_gripper,
+                           float target_gripper) {
+        auto now = this->get_clock()->now();
+        
+        // 发布当前状态
+        sensor_msgs::msg::JointState current_msg;
+        current_msg.header.stamp = now;
+        current_msg.header.frame_id = "base_link";
+        
+        // 关节名称
+        current_msg.name.resize(num_joints_ + 1);
+        for (int i = 0; i < num_joints_; ++i) {
+            current_msg.name[i] = "joint_" + std::to_string(i + 1);
+        }
+        current_msg.name[num_joints_] = "gripper";
+        
+        // 当前关节位置（弧度）
+        current_msg.position.resize(num_joints_ + 1);
+        for (int i = 0; i < num_joints_; ++i) {
+            current_msg.position[i] = current_joints_kdl(i);
+        }
+        current_msg.position[num_joints_] = static_cast<double>(current_gripper);
+        
+        current_joint_states_pub_->publish(current_msg);
+        
+        // 发布目标状态
+        sensor_msgs::msg::JointState target_msg;
+        target_msg.header.stamp = now;
+        target_msg.header.frame_id = "base_link";
+        
+        // 关节名称
+        target_msg.name = current_msg.name;
+        
+        // 目标关节位置（弧度）
+        target_msg.position.resize(num_joints_ + 1);
+        for (int i = 0; i < num_joints_; ++i) {
+            target_msg.position[i] = static_cast<double>(target_joints_vec[i] * M_PI / 180.0);
+        }
+        target_msg.position[num_joints_] = static_cast<double>(target_gripper);
+        
+        target_joint_states_pub_->publish(target_msg);
     }
 
     // ========== Home功能相关函数 ==========
@@ -875,6 +935,21 @@ private:
                     publishTF(current_ee_frame_, target_ee_frame_);
                 }
 
+                // ========== 发布关节和夹爪状态 ==========
+                
+                // 获取当前夹爪位置和目标关节
+                float current_gripper;
+                std::vector<float> target_joints_copy;
+                {
+                    std::lock_guard<std::mutex> lock(state_mutex_);
+                    current_gripper = current_gripper_;
+                    target_joints_copy = target_joints_;
+                }
+                
+                // 发布状态（current_joints_kdl 已经在前面计算好了）
+                publishJointStates(current_joints_kdl, target_joints_copy, 
+                                  current_gripper, new_gripper_target);
+
                 // 性能统计
                 auto loop_end = std::chrono::steady_clock::now();
                 auto loop_duration_ms = std::chrono::duration<double, std::milli>(loop_end - loop_start).count();
@@ -976,11 +1051,14 @@ private:
                     RCLCPP_ERROR(this->get_logger(), "Failed to send command");
                 }
 
-                // 更新当前关节位置
+                // 更新当前关节位置和夹爪位置
                 auto current = normalizeAngles(robot_controller_->getJointPositions());
+                float gripper_pos = robot_controller_->getGripperPosition() / 100.0f;
+                
                 {
                     std::lock_guard<std::mutex> lock(state_mutex_);
                     current_joints_ = current;
+                    current_gripper_ = gripper_pos;
                 }
 
                 // 性能统计
@@ -1054,6 +1132,10 @@ private:
     rclcpp::Subscription<std_msgs::msg::Bool>::SharedPtr button_x_sub_;
     rclcpp::Subscription<std_msgs::msg::Bool>::SharedPtr button_y_sub_;
 
+    // ROS2 发布器
+    rclcpp::Publisher<sensor_msgs::msg::JointState>::SharedPtr current_joint_states_pub_;
+    rclcpp::Publisher<sensor_msgs::msg::JointState>::SharedPtr target_joint_states_pub_;
+
     // TF broadcaster
     std::shared_ptr<tf2_ros::TransformBroadcaster> tf_broadcaster_;
 
@@ -1087,6 +1169,7 @@ private:
     std::vector<float> target_joints_;
     std::vector<float> current_joints_;
     float target_gripper_;
+    float current_gripper_;  // 新增：当前夹爪位置
 
     // Frame 状态（受 frame_mutex_ 保护）
     std::mutex frame_mutex_;
@@ -1152,6 +1235,7 @@ int main(int argc, char** argv) {
     std::cout << "==================================" << std::endl;
     std::cout << "Gen3 XR Teleoperation ROS2 Node" << std::endl;
     std::cout << "  with Home Function" << std::endl;
+    std::cout << "  with State Publishing" << std::endl;
     std::cout << "==================================" << std::endl;
     std::cout << "Robot IP: " << robot_ip << std::endl;
     std::cout << "URDF: " << urdf_path << std::endl;
