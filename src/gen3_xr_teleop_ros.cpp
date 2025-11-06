@@ -1,6 +1,7 @@
 /**
- * Gen3 XR Teleoperation ROS2 Node (Simplified Version)
+ * Gen3 XR Teleoperation ROS2 Node (Simplified Version with Home Function)
  * 订阅 XR 数据话题，实时控制 Kinova Gen3 机械臂
+ * 新增功能：Left Grip控制的回零功能
  */
 
 #include <rclcpp/rclcpp.hpp>
@@ -59,7 +60,7 @@ void signal_handler(int sig) {
 }
 
 /**
- * ROS2 节点：Gen3 XR 遥操作控制器（精简版）
+ * ROS2 节点：Gen3 XR 遥操作控制器（精简版 + Home功能）
  */
 class Gen3XRTeleopNode : public rclcpp::Node {
 public:
@@ -84,7 +85,13 @@ public:
           filter_alpha_(0.005f),
           gripper_control_mode_(0),  // 0: trigger mode, 1: button mode
           gripper_step_value_(0.1f),
-          gripper_button_repeat_interval_(0.1)
+          gripper_button_repeat_interval_(0.1),
+          left_grip_active_(false),
+          left_grip_active_prev_(false),
+          home_enable_(false),
+          home_enable_prev_(false),
+          home_trajectory_index_(0),
+          home_speed_deg_per_sec_(5.0f)
     {
         // 初始化状态向量
         target_joints_.resize(num_joints_, 0.0f);
@@ -92,11 +99,15 @@ public:
         filtered_joint_state_.resize(num_joints_, 0.0f);
         target_gripper_ = 0.0f;
 
+        // 初始化home位置（全部为0度）
+        home_joints_position_.resize(num_joints_, 0.0f);
+
         // 初始化坐标变换
         initializeTransforms();
 
         // 初始化 XR 数据（默认值）
         xr_right_grip_ = 0.0f;
+        xr_left_grip_ = 0.0f;
         xr_right_trigger_ = 0.0f;
         xr_controller_pose_.resize(7, 0.0);
 
@@ -118,6 +129,10 @@ public:
         grip_sub_ = this->create_subscription<std_msgs::msg::Float32>(
             "xr/right_grip", 10,
             std::bind(&Gen3XRTeleopNode::gripCallback, this, std::placeholders::_1));
+
+        left_grip_sub_ = this->create_subscription<std_msgs::msg::Float32>(
+            "xr/left_grip", 10,
+            std::bind(&Gen3XRTeleopNode::leftGripCallback, this, std::placeholders::_1));
 
         trigger_sub_ = this->create_subscription<std_msgs::msg::Float32>(
             "xr/right_trigger", 10,
@@ -153,6 +168,8 @@ public:
         RCLCPP_INFO(this->get_logger(), "  - Button X: Increase gripper (in button mode)");
         RCLCPP_INFO(this->get_logger(), "  - Button Y: Decrease gripper (in button mode)");
         RCLCPP_INFO(this->get_logger(), "  - Hold button: Repeat every 0.1s");
+        RCLCPP_INFO(this->get_logger(), "Home control:");
+        RCLCPP_INFO(this->get_logger(), "  - Left Grip: Toggle home mode (move to zero position)");
     }
 
     ~Gen3XRTeleopNode() {
@@ -233,6 +250,11 @@ private:
     void gripCallback(const std_msgs::msg::Float32::SharedPtr msg) {
         std::lock_guard<std::mutex> lock(xr_data_mutex_);
         xr_right_grip_ = msg->data;
+    }
+
+    void leftGripCallback(const std_msgs::msg::Float32::SharedPtr msg) {
+        std::lock_guard<std::mutex> lock(xr_data_mutex_);
+        xr_left_grip_ = msg->data;
     }
 
     void triggerCallback(const std_msgs::msg::Float32::SharedPtr msg) {
@@ -492,6 +514,76 @@ private:
         tf_broadcaster_->sendTransform(target_tf);
     }
 
+    // ========== Home功能相关函数 ==========
+
+    void generateHomeTrajectory(const std::vector<float>& current_joints,
+                                const std::vector<float>& target_joints) {
+        // 清空之前的轨迹
+        home_trajectory_.clear();
+        home_trajectory_index_ = 0;
+
+        // 计算每帧的步进量（deg/frame）
+        float step_per_frame = home_speed_deg_per_sec_ / static_cast<float>(ik_rate_hz_);
+
+        // 先将home_joints展开到current_joints附近
+        std::vector<float> unwrapped_target(num_joints_);
+        for (int i = 0; i < num_joints_; ++i) {
+            unwrapped_target[i] = unwrapAngle(target_joints[i], current_joints[i]);
+        }
+
+        // 计算每个关节需要的步数
+        std::vector<float> deltas(num_joints_);
+        int max_steps = 0;
+        for (int i = 0; i < num_joints_; ++i) {
+            deltas[i] = unwrapped_target[i] - current_joints[i];
+            int steps_needed = static_cast<int>(std::ceil(std::abs(deltas[i]) / step_per_frame));
+            max_steps = std::max(max_steps, steps_needed);
+        }
+
+        // 如果已经在目标位置附近，不需要生成轨迹
+        if (max_steps == 0) {
+            RCLCPP_INFO(this->get_logger(), "Already at home position");
+            return;
+        }
+
+        // 计算每个关节每帧的步进量
+        std::vector<float> steps(num_joints_);
+        for (int i = 0; i < num_joints_; ++i) {
+            if (max_steps > 0) {
+                steps[i] = deltas[i] / static_cast<float>(max_steps);
+            } else {
+                steps[i] = 0.0f;
+            }
+        }
+
+        // 生成轨迹
+        for (int step = 0; step <= max_steps; ++step) {
+            std::vector<float> waypoint(num_joints_);
+            for (int i = 0; i < num_joints_; ++i) {
+                float target_value = current_joints[i] + steps[i] * static_cast<float>(step);
+                
+                // 限制不超过目标值（根据步进方向）
+                if (steps[i] > 0) {
+                    waypoint[i] = std::min(target_value, unwrapped_target[i]);
+                } else if (steps[i] < 0) {
+                    waypoint[i] = std::max(target_value, unwrapped_target[i]);
+                } else {
+                    waypoint[i] = current_joints[i];
+                }
+            }
+            home_trajectory_.push_back(waypoint);
+        }
+
+        // 强制最后一个waypoint等于目标位置（避免浮点数误差）
+        if (!home_trajectory_.empty()) {
+            home_trajectory_.back() = unwrapped_target;
+        }
+
+        RCLCPP_INFO(this->get_logger(), 
+                   "Generated home trajectory with %zu waypoints (%.2f deg/s)",
+                   home_trajectory_.size(), home_speed_deg_per_sec_);
+    }
+
     // ========== 线程函数 ==========
 
     void ikThread() {
@@ -508,13 +600,14 @@ private:
             auto loop_start = std::chrono::steady_clock::now();
 
             try {
-                // 获取 XR 输入（直接使用当前pose）
-                float grip_value, trigger_value;
+                // 获取 XR 输入
+                float grip_value, trigger_value, left_grip_value;
                 bool button_a, button_b, button_x, button_y;
                 std::vector<double> controller_pose;
                 {
                     std::lock_guard<std::mutex> lock(xr_data_mutex_);
                     grip_value = xr_right_grip_;
+                    left_grip_value = xr_left_grip_;
                     trigger_value = xr_right_trigger_;
                     button_a = button_a_state_;
                     button_b = button_b_state_;
@@ -522,6 +615,72 @@ private:
                     button_y = button_y_state_;
                     controller_pose = xr_controller_pose_;
                 }
+
+                // ========== 处理Left Grip和Home逻辑 ==========
+                
+                // 更新left_grip_active状态
+                if (!left_grip_active_ && left_grip_value > 0.9f) {
+                    left_grip_active_ = true;
+                } else if (left_grip_active_ && left_grip_value < 0.5f) {
+                    left_grip_active_ = false;
+                }
+
+                // 检测left_grip_active的上升沿，切换home_enable
+                if (left_grip_active_ && !left_grip_active_prev_) {
+                    home_enable_ = !home_enable_;
+                    RCLCPP_INFO(this->get_logger(), "Home mode %s", 
+                               home_enable_ ? "ENABLED" : "DISABLED");
+                    
+                    // 如果从disabled变为enabled，生成轨迹
+                    if (home_enable_ && !home_enable_prev_) {
+                        std::vector<float> current_joints_copy;
+                        {
+                            std::lock_guard<std::mutex> lock(state_mutex_);
+                            current_joints_copy = current_joints_;
+                        }
+                        generateHomeTrajectory(current_joints_copy, home_joints_position_);
+                    }
+                    
+                    // 如果从enabled变为disabled，清空轨迹
+                    if (!home_enable_ && home_enable_prev_) {
+                        home_trajectory_.clear();
+                        home_trajectory_index_ = 0;
+                        RCLCPP_INFO(this->get_logger(), "Home trajectory cleared");
+                    }
+                }
+                
+                left_grip_active_prev_ = left_grip_active_;
+
+                // ========== Home执行逻辑 ==========
+                
+                // 如果home_enable为true，禁用正常控制
+                if (home_enable_) {
+                    is_active_ = false;
+                    
+                    // 执行home轨迹
+                    if (!home_trajectory_.empty() && home_trajectory_index_ < home_trajectory_.size()) {
+                        // 更新target_joints为当前轨迹点
+                        {
+                            std::lock_guard<std::mutex> lock(state_mutex_);
+                            target_joints_ = home_trajectory_[home_trajectory_index_];
+                        }
+                        
+                        // 移动到下一个轨迹点
+                        home_trajectory_index_++;
+                        
+                        // 检查是否完成
+                        if (home_trajectory_index_ >= home_trajectory_.size()) {
+                            RCLCPP_INFO(this->get_logger(), "Home trajectory completed");
+                            home_enable_ = false;
+                            home_trajectory_.clear();
+                            home_trajectory_index_ = 0;
+                        }
+                    }
+                }
+
+                home_enable_prev_ = home_enable_;
+
+                // ========== 原有的按钮和夹爪逻辑 ==========
 
                 // 处理按钮 A：切换控制模式
                 if (button_a && !button_a_prev_) {
@@ -557,7 +716,7 @@ private:
                     // Trigger 模式：直接使用 trigger 值
                     new_gripper_target = std::max(0.0f, std::min(1.0f, trigger_value));
                 } else {
-                    // Button 模式：使用 X/Y 按钮增减（带重复间隔）
+                    // Button 模式：使用 X/Y 按钮增减
                     auto current_time = std::chrono::steady_clock::now();
 
                     // 处理按钮 X：增加
@@ -619,6 +778,8 @@ private:
                     target_gripper_ = new_gripper_target;
                 }
 
+                // ========== 原有的IK和控制逻辑 ==========
+
                 // 获取当前关节位置用于 FK（弧度）
                 KDL::JntArray current_joints_kdl(num_joints_);
                 {
@@ -628,7 +789,7 @@ private:
                     }
                 }
 
-                // 计算当前 end effector frame（每次循环都更新）
+                // 计算当前 end effector frame
                 KDL::Frame current_ee_frame;
                 fk_solver_->JntToCart(current_joints_kdl, current_ee_frame);
 
@@ -638,8 +799,8 @@ private:
                     current_ee_frame_ = current_ee_frame;
                 }
 
-                // 检查激活状态
-                bool new_active = (grip_value > 0.9f);
+                // 检查激活状态（只有在非home模式下才能激活）
+                bool new_active = (grip_value > 0.9f) && !home_enable_;
 
                 if (new_active != is_active_) {
                     if (new_active) {
@@ -695,7 +856,7 @@ private:
                             }
                         }
 
-                        // 更新 target frame（只在IK成功时更新）
+                        // 更新 target frame
                         {
                             std::lock_guard<std::mutex> lock(frame_mutex_);
                             target_ee_frame_ = target_frame;
@@ -714,7 +875,7 @@ private:
                     publishTF(current_ee_frame_, target_ee_frame_);
                 }
 
-                // 性能统计和超时检测
+                // 性能统计
                 auto loop_end = std::chrono::steady_clock::now();
                 auto loop_duration_ms = std::chrono::duration<double, std::milli>(loop_end - loop_start).count();
                 
@@ -777,7 +938,7 @@ private:
             auto loop_start = std::chrono::steady_clock::now();
 
             try {
-                // 获取目标位置（度）
+                // 获取目标位置
                 std::vector<float> target_joints;
                 float target_gripper;
                 {
@@ -789,25 +950,22 @@ private:
                 // 应用低通滤波（保持"展开"到最近参考）
                 std::vector<float> filtered_joints = filterJointPositions(target_joints);
 
-                // 读取当前关节（度）作为限幅参考
+                // 读取当前关节
                 std::vector<float> current_joints_copy;
                 {
                     std::lock_guard<std::mutex> lock(state_mutex_);
                     current_joints_copy = current_joints_;
                 }
 
-                // 限幅：基于最短弧差 + 每周期最大步进
+                // 限幅
                 std::vector<float> clamped_joints = current_joints_copy;
                 for (int i = 0; i < num_joints_; ++i) {
-                    // 最短路径差值，范围 (-180, 180]，单位：度
                     float delta = std::remainder(filtered_joints[i] - current_joints_copy[i], 360.0f);
-                    // 限制单步变化
                     delta = clampf(delta, -max_step_deg, max_step_deg);
-                    // 应用限幅
                     clamped_joints[i] = current_joints_copy[i] + delta;
                 }
 
-                // 发送限幅后的关节位置
+                // 发送命令
                 robot_controller_->setJointPositions(clamped_joints);
 
                 // 发送夹爪命令
@@ -818,7 +976,7 @@ private:
                     RCLCPP_ERROR(this->get_logger(), "Failed to send command");
                 }
 
-                // 更新当前关节位置（度）——从驱动读取后做到 [-180,180) 仅用于显示/稳定性
+                // 更新当前关节位置
                 auto current = normalizeAngles(robot_controller_->getJointPositions());
                 {
                     std::lock_guard<std::mutex> lock(state_mutex_);
@@ -888,6 +1046,7 @@ private:
 
     // ROS2 订阅器
     rclcpp::Subscription<std_msgs::msg::Float32>::SharedPtr grip_sub_;
+    rclcpp::Subscription<std_msgs::msg::Float32>::SharedPtr left_grip_sub_;
     rclcpp::Subscription<std_msgs::msg::Float32>::SharedPtr trigger_sub_;
     rclcpp::Subscription<geometry_msgs::msg::PoseStamped>::SharedPtr pose_sub_;
     rclcpp::Subscription<std_msgs::msg::Bool>::SharedPtr button_a_sub_;
@@ -901,6 +1060,7 @@ private:
     // XR 数据（受 xr_data_mutex_ 保护）
     std::mutex xr_data_mutex_;
     float xr_right_grip_;
+    float xr_left_grip_;
     float xr_right_trigger_;
     std::vector<double> xr_controller_pose_;
 
@@ -924,9 +1084,8 @@ private:
 
     // 机械臂状态（受 state_mutex_ 保护）
     std::mutex state_mutex_;
-    std::vector<float> target_joints_;   // 目标关节角（°，可超±180 做"展开"）
-    std::vector<float> current_joints_;  // 当前关节角（°，normalizeAngles 后）
-
+    std::vector<float> target_joints_;
+    std::vector<float> current_joints_;
     float target_gripper_;
 
     // Frame 状态（受 frame_mutex_ 保护）
@@ -956,6 +1115,16 @@ private:
     std::vector<float> filtered_joint_state_;
     bool filter_initialized_;
     const float filter_alpha_;
+
+    // ========== Home功能相关变量 ==========
+    bool left_grip_active_;
+    bool left_grip_active_prev_;
+    bool home_enable_;
+    bool home_enable_prev_;
+    std::vector<float> home_joints_position_;  // 回零目标位置
+    std::vector<std::vector<float>> home_trajectory_;  // 回零轨迹序列
+    size_t home_trajectory_index_;  // 当前执行到的轨迹索引
+    float home_speed_deg_per_sec_;  // 回零速度（度/秒）
 };
 
 // ========== Main ==========
@@ -982,6 +1151,7 @@ int main(int argc, char** argv) {
 
     std::cout << "==================================" << std::endl;
     std::cout << "Gen3 XR Teleoperation ROS2 Node" << std::endl;
+    std::cout << "  with Home Function" << std::endl;
     std::cout << "==================================" << std::endl;
     std::cout << "Robot IP: " << robot_ip << std::endl;
     std::cout << "URDF: " << urdf_path << std::endl;
