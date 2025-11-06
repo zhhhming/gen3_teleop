@@ -22,7 +22,7 @@
 #include <signal.h>
 #include <algorithm>
 #include <cmath>
-
+#include <fstream>
 #ifdef __linux__
 #include <pthread.h>
 #include <sched.h>
@@ -75,7 +75,7 @@ public:
           udp_port_(udp_port),
           shutdown_requested_(false),
           num_joints_(7),
-          scale_factor_(1.0f),
+          scale_factor_(1.2f),
           ik_rate_hz_(50),
           control_rate_hz_(1000),
           is_active_(false),
@@ -91,7 +91,7 @@ public:
           home_enable_(false),
           home_enable_prev_(false),
           home_trajectory_index_(0),
-          home_speed_deg_per_sec_(5.0f)
+          home_speed_deg_per_sec_(16.0f)
     {
         // 初始化状态向量
         target_joints_.resize(num_joints_, 0.0f);
@@ -100,7 +100,7 @@ public:
         target_gripper_ = 0.0f;
 
         // 初始化home位置（全部为0度）
-        home_joints_position_.resize(num_joints_, 0.0f);
+        home_joints_position_ = {0.0f, 22.73f, 180.0f, 246.74f, 8.27f, 2.62f, 262.64f};
 
         // 初始化坐标变换
         initializeTransforms();
@@ -457,8 +457,8 @@ private:
         }
 
         // 应用 90 度旋转
-        delta_pos = R_z_90_cw_ * delta_pos;
-        delta_rot = R_z_90_cw_ * delta_rot;
+        delta_pos = R_z_90_cw_ * R_z_90_cw_ * delta_pos;
+        delta_rot = R_z_90_cw_ * R_z_90_cw_ * delta_rot;
     }
 
     KDL::Frame eigenToKDL(const Eigen::Vector3d& pos, const Eigen::Quaterniond& quat) {
@@ -932,7 +932,7 @@ private:
         auto last_report = std::chrono::steady_clock::now();
 
         // 期望的"最大角速度" (°/s)。可按实际需求调参或做成每关节数组。
-        const float max_step_deg = 0.8f;
+        const float max_step_deg = 0.6f;
 
         while (!shutdown_requested_ && !g_shutdown_requested) {
             auto loop_start = std::chrono::steady_clock::now();
