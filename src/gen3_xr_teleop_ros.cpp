@@ -1,6 +1,6 @@
 /**
- * Gen3 XR Teleoperation ROS2 Node with Data Logging and Overrun Compensation
- * 订阅 XR 数据话题，实时控制 Kinova Gen3 机械臂，并记录位置数据
+ * Gen3 XR Teleoperation ROS2 Node (Simplified Version)
+ * 订阅 XR 数据话题，实时控制 Kinova Gen3 机械臂
  */
 
 #include <rclcpp/rclcpp.hpp>
@@ -19,10 +19,8 @@
 #include <vector>
 #include <deque>
 #include <signal.h>
-#include <fstream>
 #include <algorithm>
 #include <cmath>
-#include <iomanip>
 
 #ifdef __linux__
 #include <pthread.h>
@@ -60,36 +58,20 @@ void signal_handler(int sig) {
     g_shutdown_requested = true;
 }
 
-// 数据记录结构
-struct JointDataPoint {
-    double timestamp;  // 相对于开始时间的秒数
-    std::vector<float> current_positions;  // 当前位置（°）
-    std::vector<float> target_positions;   // 目标位置（°，已做就近映射）
-    std::vector<float> differences;        // 差值（°）
-};
-
-// Pose历史数据结构
-struct PoseHistoryEntry {
-    std::chrono::steady_clock::time_point timestamp;
-    std::vector<double> pose;  // 7个元素：x,y,z,qx,qy,qz,qw
-};
-
 /**
- * ROS2 节点：Gen3 XR 遥操作控制器（带数据记录和超时补偿）
+ * ROS2 节点：Gen3 XR 遥操作控制器（精简版）
  */
 class Gen3XRTeleopNode : public rclcpp::Node {
 public:
     Gen3XRTeleopNode(const std::string& robot_urdf_path,
                      const std::string& robot_ip = "192.168.1.10",
                      int tcp_port = 10000,
-                     int udp_port = 10001,
-                     const std::string& log_file = "joint_tracking_data.csv")
+                     int udp_port = 10001)
         : Node("gen3_xr_teleop_node"),
           robot_urdf_path_(robot_urdf_path),
           robot_ip_(robot_ip),
           tcp_port_(tcp_port),
           udp_port_(udp_port),
-          log_file_path_(log_file),
           shutdown_requested_(false),
           num_joints_(7),
           scale_factor_(1.0f),
@@ -102,12 +84,7 @@ public:
           filter_alpha_(0.005f),
           gripper_control_mode_(0),  // 0: trigger mode, 1: button mode
           gripper_step_value_(0.1f),
-          gripper_button_repeat_interval_(0.1),
-          data_logging_enabled_(false),  // 默认关闭数据记录
-          overrun_time_ms_(0.0),  // 超时补偿时间（毫秒）
-          catchup_rate_ms_(30.0),  // 追赶速率（毫秒/循环）
-          max_pose_history_(1000),  // 最大历史记录数
-          xr_data_rate_ms_(5.0)  // XR数据频率（5ms = 200Hz）
+          gripper_button_repeat_interval_(0.1)
     {
         // 初始化状态向量
         target_joints_.resize(num_joints_, 0.0f);
@@ -136,9 +113,6 @@ public:
         // 初始化按钮计时器
         button_x_last_trigger_time_ = std::chrono::steady_clock::now();
         button_y_last_trigger_time_ = std::chrono::steady_clock::now();
-
-        // 初始化数据记录
-        start_time_ = std::chrono::steady_clock::now();
 
         // 创建订阅器
         grip_sub_ = this->create_subscription<std_msgs::msg::Float32>(
@@ -173,16 +147,12 @@ public:
         tf_broadcaster_ = std::make_shared<tf2_ros::TransformBroadcaster>(this);
 
         RCLCPP_INFO(this->get_logger(), "Gen3 XR Teleop Node created");
-        RCLCPP_INFO(this->get_logger(), "Data logging: %s",
-                   data_logging_enabled_ ? "ENABLED" : "DISABLED");
-        RCLCPP_INFO(this->get_logger(), "Log file: %s", log_file_path_.c_str());
-        RCLCPP_INFO(this->get_logger(), "Overrun compensation: catchup_rate=%.1fms/cycle", catchup_rate_ms_);
         RCLCPP_INFO(this->get_logger(), "Gripper control:");
         RCLCPP_INFO(this->get_logger(), "  - Button A: Toggle control mode (Trigger/Button)");
         RCLCPP_INFO(this->get_logger(), "  - Button B: Cycle step value (0.1/0.01/0.001/0.0001)");
         RCLCPP_INFO(this->get_logger(), "  - Button X: Increase gripper (in button mode)");
         RCLCPP_INFO(this->get_logger(), "  - Button Y: Decrease gripper (in button mode)");
-        RCLCPP_INFO(this->get_logger(), "  - Hold button: Repeat every 0.2s");
+        RCLCPP_INFO(this->get_logger(), "  - Hold button: Repeat every 0.1s");
     }
 
     ~Gen3XRTeleopNode() {
@@ -242,11 +212,6 @@ public:
             control_thread.join();
         }
 
-        // 保存数据
-        if (data_logging_enabled_) {
-            saveLoggedData();
-        }
-
         RCLCPP_INFO(this->get_logger(), "Teleoperation stopped");
     }
 
@@ -278,7 +243,6 @@ private:
     void poseCallback(const geometry_msgs::msg::PoseStamped::SharedPtr msg) {
         std::lock_guard<std::mutex> lock(xr_data_mutex_);
         
-        // 更新当前pose
         xr_controller_pose_[0] = msg->pose.position.x;
         xr_controller_pose_[1] = msg->pose.position.y;
         xr_controller_pose_[2] = msg->pose.position.z;
@@ -286,18 +250,6 @@ private:
         xr_controller_pose_[4] = msg->pose.orientation.y;
         xr_controller_pose_[5] = msg->pose.orientation.z;
         xr_controller_pose_[6] = msg->pose.orientation.w;
-        
-        // 添加到历史队列
-        PoseHistoryEntry entry;
-        entry.timestamp = std::chrono::steady_clock::now();
-        entry.pose = xr_controller_pose_;
-        
-        pose_history_.push_back(entry);
-        
-        // 限制队列大小
-        while (pose_history_.size() > max_pose_history_) {
-            pose_history_.pop_front();
-        }
     }
 
     void buttonACallback(const std_msgs::msg::Bool::SharedPtr msg) {
@@ -437,13 +389,6 @@ private:
         return static_cast<float>(unwrapped);
     }
 
-    // 将 target 移到距离 current 最近的等效位置（考虑 360 度环绕，°）
-    float moveToNearestEquivalent(float target, float current) const {
-        // remainder(x, 360) ∈ (-180, 180]
-        const float delta = std::remainder(target - current, 360.0f);
-        return current + delta;
-    }
-
     std::vector<float> filterJointPositions(const std::vector<float>& target_positions) {
         if (!filter_initialized_) {
             initializeFilterState(target_positions);
@@ -460,38 +405,6 @@ private:
         }
 
         return filtered;
-    }
-
-    // 根据超时补偿获取历史pose
-    std::vector<double> getPoseWithCompensation() {
-        std::lock_guard<std::mutex> lock(xr_data_mutex_);
-        
-        // 如果历史队列为空，返回当前值
-        if (pose_history_.empty()) {
-            return xr_controller_pose_;
-        }
-        
-        // 读取 atomic 变量
-        double overrun_ms = overrun_time_ms_.load();
-        
-        // 如果没有超时，返回最新值
-        if (overrun_ms <= 0.0) {
-            return pose_history_.back().pose;
-        }
-        
-        // 计算需要回溯的步数
-        int steps_back = static_cast<int>(overrun_ms / xr_data_rate_ms_);
-        
-        // 限制在有效范围内
-        int history_index = static_cast<int>(pose_history_.size()) - 1 - steps_back;
-        history_index = std::max(0, history_index);
-        
-        // 输出追赶信息
-        RCLCPP_INFO_THROTTLE(this->get_logger(), *this->get_clock(), 500,  // 每500ms最多输出一次
-                            "Catching up: overrun_time=%.1fms, steps_back=%d, using index=%d/%zu",
-                            overrun_ms, steps_back, history_index, pose_history_.size());
-        
-        return pose_history_[history_index].pose;
     }
 
     void processControllerPose(const std::vector<double>& xr_pose,
@@ -579,74 +492,6 @@ private:
         tf_broadcaster_->sendTransform(target_tf);
     }
 
-    // ========== 数据记录函数 ==========
-
-    void logJointData(const std::vector<float>& current, const std::vector<float>& target) {
-        if (!data_logging_enabled_) return;
-
-        auto now = std::chrono::steady_clock::now();
-        double elapsed = std::chrono::duration<double>(now - start_time_).count();
-
-        JointDataPoint data_point;
-        data_point.timestamp = elapsed;
-        data_point.current_positions = current;
-
-        // 处理target positions：移到距离current最近的等效位置
-        data_point.target_positions.resize(num_joints_);
-        data_point.differences.resize(num_joints_);
-
-        for (int i = 0; i < num_joints_; ++i) {
-            float adjusted_target = moveToNearestEquivalent(target[i], current[i]);
-            data_point.target_positions[i] = adjusted_target;
-            data_point.differences[i] = adjusted_target - current[i];
-        }
-
-        std::lock_guard<std::mutex> lock(log_data_mutex_);
-        logged_data_.push_back(data_point);
-    }
-
-    void saveLoggedData() {
-        std::lock_guard<std::mutex> lock(log_data_mutex_);
-
-        if (logged_data_.empty()) {
-            RCLCPP_WARN(this->get_logger(), "No data to save");
-            return;
-        }
-
-        std::ofstream file(log_file_path_);
-        if (!file.is_open()) {
-            RCLCPP_ERROR(this->get_logger(), "Failed to open log file: %s",
-                        log_file_path_.c_str());
-            return;
-        }
-
-        // 写入表头
-        file << "timestamp";
-        for (int i = 0; i < num_joints_; ++i) {
-            file << ",current_j" << i
-                 << ",target_j" << i
-                 << ",diff_j" << i;
-        }
-        file << "\n";
-
-        // 写入数据
-        file << std::fixed << std::setprecision(6);
-        for (const auto& data : logged_data_) {
-            file << data.timestamp;
-            for (int i = 0; i < num_joints_; ++i) {
-                file << "," << data.current_positions[i]
-                     << "," << data.target_positions[i]
-                     << "," << data.differences[i];
-            }
-            file << "\n";
-        }
-
-        file.close();
-
-        RCLCPP_INFO(this->get_logger(), "Saved %zu data points to %s",
-                   logged_data_.size(), log_file_path_.c_str());
-    }
-
     // ========== 线程函数 ==========
 
     void ikThread() {
@@ -655,7 +500,7 @@ private:
         
         // 性能统计变量
         std::deque<double> ik_loop_times;
-        const size_t max_samples = 100;  // IK线程频率低，采样少一些
+        const size_t max_samples = 100;
         auto last_report = std::chrono::steady_clock::now();
         const double overrun_threshold_ms = 40.0;  // 严重超时阈值（毫秒）
 
@@ -663,12 +508,7 @@ private:
             auto loop_start = std::chrono::steady_clock::now();
 
             try {
-                // 更新超时补偿时间（每循环减少，最小为0）
-                double current_overrun = overrun_time_ms_.load();
-                double new_overrun = std::max(0.0, current_overrun - catchup_rate_ms_);
-                overrun_time_ms_.store(new_overrun);
-                
-                // 获取 XR 输入（带补偿的pose）
+                // 获取 XR 输入（直接使用当前pose）
                 float grip_value, trigger_value;
                 bool button_a, button_b, button_x, button_y;
                 std::vector<double> controller_pose;
@@ -680,10 +520,8 @@ private:
                     button_b = button_b_state_;
                     button_x = button_x_state_;
                     button_y = button_y_state_;
+                    controller_pose = xr_controller_pose_;
                 }
-                
-                // 根据超时补偿获取pose
-                controller_pose = getPoseWithCompensation();
 
                 // 处理按钮 A：切换控制模式
                 if (button_a && !button_a_prev_) {
@@ -886,14 +724,11 @@ private:
                     ik_loop_times.pop_front();
                 }
                 
-                // 检测严重超时
+                // 检测严重超时（仅警告）
                 if (loop_duration_ms > overrun_threshold_ms) {
-                    double overrun_ms = loop_duration_ms - 20.0;  // 超过期望周期的时间
-                    double current_overrun = overrun_time_ms_.load();
-                    overrun_time_ms_.store(current_overrun + overrun_ms);
                     RCLCPP_WARN(this->get_logger(), 
-                               "IK loop OVERRUN: duration=%.2fms, overrun=%.2fms, total_overrun=%.2fms",
-                               loop_duration_ms, overrun_ms, current_overrun + overrun_ms);
+                               "IK loop OVERRUN: duration=%.2fms (threshold=%.2fms)",
+                               loop_duration_ms, overrun_threshold_ms);
                 }
                 
                 // 定期报告性能
@@ -906,8 +741,8 @@ private:
                     avg /= ik_loop_times.size();
                     
                     RCLCPP_INFO(this->get_logger(),
-                               "IK loop: avg=%.2fms, max=%.2fms, rate=%.1fHz, overrun_time=%.1fms",
-                               avg, maxv, 1000.0/avg, overrun_time_ms_.load());
+                               "IK loop: avg=%.2fms, max=%.2fms, rate=%.1fHz",
+                               avg, maxv, 1000.0/avg);
                     
                     last_report = loop_end;
                 }
@@ -936,7 +771,7 @@ private:
         auto last_report = std::chrono::steady_clock::now();
 
         // 期望的"最大角速度" (°/s)。可按实际需求调参或做成每关节数组。
-        const float max_step_deg  = 0.8f;
+        const float max_step_deg = 0.8f;
 
         while (!shutdown_requested_ && !g_shutdown_requested) {
             auto loop_start = std::chrono::steady_clock::now();
@@ -990,11 +825,6 @@ private:
                     current_joints_ = current;
                 }
 
-                // 记录数据（原始 target_joints）
-                if (data_logging_enabled_) {
-                    logJointData(current, target_joints);
-                }
-
                 // 性能统计
                 auto loop_end = std::chrono::steady_clock::now();
                 auto loop_duration = std::chrono::duration<double>(loop_end - loop_start).count();
@@ -1013,8 +843,8 @@ private:
                     avg /= loop_times.size();
 
                     RCLCPP_INFO(this->get_logger(),
-                               "Control loop: avg=%.2fms, max=%.2fms, rate=%.1fHz, logged=%zu points",
-                               avg, maxv, 1000.0/avg, logged_data_.size());
+                               "Control loop: avg=%.2fms, max=%.2fms, rate=%.1fHz",
+                               avg, maxv, 1000.0/avg);
 
                     last_report = loop_end;
                 }
@@ -1073,7 +903,6 @@ private:
     float xr_right_grip_;
     float xr_right_trigger_;
     std::vector<double> xr_controller_pose_;
-    std::deque<PoseHistoryEntry> pose_history_;  // Pose历史队列
 
     // 按钮状态
     bool button_a_state_;
@@ -1127,19 +956,6 @@ private:
     std::vector<float> filtered_joint_state_;
     bool filter_initialized_;
     const float filter_alpha_;
-
-    // 数据记录相关
-    bool data_logging_enabled_;
-    std::string log_file_path_;
-    std::chrono::steady_clock::time_point start_time_;
-    std::mutex log_data_mutex_;
-    std::vector<JointDataPoint> logged_data_;
-
-    // 超时补偿相关
-    std::atomic<double> overrun_time_ms_;  // 累积超时时间（毫秒）
-    double catchup_rate_ms_;  // 追赶速率（毫秒/循环）
-    size_t max_pose_history_;  // 最大历史记录数
-    double xr_data_rate_ms_;  // XR数据周期（毫秒）
 };
 
 // ========== Main ==========
@@ -1155,7 +971,6 @@ int main(int argc, char** argv) {
     // 配置
     std::string urdf_path = "/home/ming/xrrobotics_new/XRoboToolkit-Teleop-Sample-Python/assets/arx/Gen/GEN3-7DOF.urdf";
     std::string robot_ip = "192.168.1.10";
-    std::string log_file = "joint_tracking_data.csv";
 
     // 解析命令行参数
     if (argc > 1) {
@@ -1164,16 +979,12 @@ int main(int argc, char** argv) {
     if (argc > 2) {
         urdf_path = argv[2];
     }
-    if (argc > 3) {
-        log_file = argv[3];
-    }
 
     std::cout << "==================================" << std::endl;
     std::cout << "Gen3 XR Teleoperation ROS2 Node" << std::endl;
     std::cout << "==================================" << std::endl;
     std::cout << "Robot IP: " << robot_ip << std::endl;
     std::cout << "URDF: " << urdf_path << std::endl;
-    std::cout << "Log file: " << log_file << std::endl;
     std::cout << std::endl;
 
     try {
