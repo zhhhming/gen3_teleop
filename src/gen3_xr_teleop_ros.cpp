@@ -585,17 +585,31 @@ private:
         // 计算每帧的步进量（deg/frame）
         float step_per_frame = home_speed_deg_per_sec_ / static_cast<float>(ik_rate_hz_);
 
-        // 先将home_joints展开到current_joints附近
-        std::vector<float> unwrapped_target(num_joints_);
+        // 定义关节类型：revolute关节是 index 1, 3, 5 (joint_2, joint_4, joint_6)
+        // continuous关节是 index 0, 2, 4, 6 (joint_1, joint_3, joint_5, joint_7)
+        std::vector<bool> is_revolute = {false, true, false, true, false, true, false};
+
+        // 处理目标角度：对continuous关节unwrap，对revolute关节归一化到-180~180
+        std::vector<float> processed_target(num_joints_);
+        std::vector<float> processed_current(num_joints_);
+        
         for (int i = 0; i < num_joints_; ++i) {
-            unwrapped_target[i] = unwrapAngle(target_joints[i], current_joints[i]);
+            if (is_revolute[i]) {
+                // Revolute关节：将两个角度都归一化到-180~180度范围
+                processed_current[i] = normalizeAngle(current_joints[i]);
+                processed_target[i] = normalizeAngle(target_joints[i]);
+            } else {
+                // Continuous关节：使用unwrap方法找最近路径
+                processed_current[i] = current_joints[i];
+                processed_target[i] = unwrapAngle(target_joints[i], current_joints[i]);
+            }
         }
 
         // 计算每个关节需要的步数
         std::vector<float> deltas(num_joints_);
         int max_steps = 0;
         for (int i = 0; i < num_joints_; ++i) {
-            deltas[i] = unwrapped_target[i] - current_joints[i];
+            deltas[i] = processed_target[i] - processed_current[i];
             int steps_needed = static_cast<int>(std::ceil(std::abs(deltas[i]) / step_per_frame));
             max_steps = std::max(max_steps, steps_needed);
         }
@@ -620,15 +634,15 @@ private:
         for (int step = 0; step <= max_steps; ++step) {
             std::vector<float> waypoint(num_joints_);
             for (int i = 0; i < num_joints_; ++i) {
-                float target_value = current_joints[i] + steps[i] * static_cast<float>(step);
+                float target_value = processed_current[i] + steps[i] * static_cast<float>(step);
                 
                 // 限制不超过目标值（根据步进方向）
                 if (steps[i] > 0) {
-                    waypoint[i] = std::min(target_value, unwrapped_target[i]);
+                    waypoint[i] = std::min(target_value, processed_target[i]);
                 } else if (steps[i] < 0) {
-                    waypoint[i] = std::max(target_value, unwrapped_target[i]);
+                    waypoint[i] = std::max(target_value, processed_target[i]);
                 } else {
-                    waypoint[i] = current_joints[i];
+                    waypoint[i] = processed_current[i];
                 }
             }
             home_trajectory_.push_back(waypoint);
@@ -636,13 +650,26 @@ private:
 
         // 强制最后一个waypoint等于目标位置（避免浮点数误差）
         if (!home_trajectory_.empty()) {
-            home_trajectory_.back() = unwrapped_target;
+            home_trajectory_.back() = processed_target;
         }
 
         RCLCPP_INFO(this->get_logger(), 
                    "Generated home trajectory with %zu waypoints (%.2f deg/s)",
                    home_trajectory_.size(), home_speed_deg_per_sec_);
+        
+        // 打印调试信息
+        RCLCPP_INFO(this->get_logger(), "Home trajectory generation:");
+        for (int i = 0; i < num_joints_; ++i) {
+            RCLCPP_INFO(this->get_logger(), 
+                       "  Joint %d (%s): current=%.2f°, target=%.2f°, delta=%.2f°",
+                       i + 1, 
+                       is_revolute[i] ? "revolute" : "continuous",
+                       processed_current[i],
+                       processed_target[i],
+                       deltas[i]);
+        }
     }
+
 
     // ========== 线程函数 ==========
 
